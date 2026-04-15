@@ -1,9 +1,57 @@
 import { useState, useEffect, useMemo } from "react";
+import { supabase } from "./supabase.js";
 
-// ── Storage ──────────────────────────────────────────────────────────────────
+// ── Storage (local fallback when Supabase is unavailable) ───────────────────
 const SK = "wnf-v2";
-const load = () => { try { const r = localStorage.getItem(SK); return r ? JSON.parse(r) : null; } catch { return null; } };
-const save = (s) => { try { localStorage.setItem(SK, JSON.stringify(s)); } catch {} };
+const SEASON_ID = "wednesday-fc";
+
+const loadLocal = () => {
+  try {
+    const r = localStorage.getItem(SK);
+    return r ? JSON.parse(r) : null;
+  } catch {
+    return null;
+  }
+};
+
+const saveLocal = (s) => {
+  try {
+    localStorage.setItem(SK, JSON.stringify(s));
+  } catch {}
+};
+
+function normalizeSeason(s) {
+  if (!s || typeof s !== "object") return { matches: [], players: [] };
+  return {
+    matches: Array.isArray(s.matches) ? s.matches : [],
+    players: Array.isArray(s.players) ? s.players : [],
+  };
+}
+
+async function fetchSeasonFromSupabase() {
+  if (!supabase) return null;
+  const { data, error } = await supabase
+    .from("seasons")
+    .select("data")
+    .eq("id", SEASON_ID)
+    .maybeSingle();
+  if (error) throw error;
+  if (data?.data == null) return null;
+  return normalizeSeason(data.data);
+}
+
+async function upsertSeasonToSupabase(season) {
+  if (!supabase) return;
+  const { error } = await supabase.from("seasons").upsert(
+    {
+      id: SEASON_ID,
+      data: season,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "id" }
+  );
+  if (error) throw error;
+}
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const HOW_OPTIONS = [
@@ -224,12 +272,27 @@ body{font-family:'Figtree',sans-serif;background:#f5f5f0;min-height:100vh;color:
 
 // ── App ───────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [state, setState] = useState(() => {
-    const saved = load();
-    return saved || defaultState;
-  });
+  const [state, setState] = useState(() => loadLocal() ?? defaultState);
 
-  useEffect(() => { save(state); }, [state]);
+  useEffect(() => {
+    saveLocal(state);
+  }, [state]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const remote = await fetchSeasonFromSupabase();
+        if (cancelled || remote == null) return;
+        setState((prev) => ({ ...prev, season: remote }));
+      } catch (e) {
+        console.warn("Supabase load failed; using local cache", e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const update = (fn) => setState(prev => ({ ...prev, ...fn(prev) }));
 
@@ -268,11 +331,22 @@ export default function App() {
 
   const saveCurrentMatch = () => {
     if (!currentMatch) return;
-    update(prev => ({
-      season: { ...prev.season, matches: [...prev.season.matches, currentMatch] },
-      currentMatch: null,
-      view: "dashboard",
-    }));
+    setState((prev) => {
+      if (!prev.currentMatch) return prev;
+      const nextSeason = {
+        ...prev.season,
+        matches: [...prev.season.matches, prev.currentMatch],
+      };
+      upsertSeasonToSupabase(nextSeason).catch((e) => {
+        console.warn("Supabase save failed; data kept in local storage", e);
+      });
+      return {
+        ...prev,
+        season: nextSeason,
+        currentMatch: null,
+        view: "dashboard",
+      };
+    });
   };
 
   // ── Event logging ──
@@ -816,7 +890,11 @@ export default function App() {
       )}
       <button className="btn btn-danger btn-sm" onClick={() => {
         if (window.confirm("Reset entire season? This cannot be undone.")) {
-          update(() => ({ season: { matches: [], players: [] } }));
+          const empty = { matches: [], players: [] };
+          upsertSeasonToSupabase(empty).catch((e) => {
+            console.warn("Supabase save failed; data kept in local storage", e);
+          });
+          update(() => ({ season: empty }));
         }
       }}>
         Reset season
