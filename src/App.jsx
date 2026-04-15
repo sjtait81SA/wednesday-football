@@ -65,29 +65,116 @@ const HOW_OPTIONS = [
   { value: "assist_tap",  label: "Five-yard assist 🎯",     quip: "Square ball. 'That's an assist.'" },
 ];
 
-const GOALMOUTH = [
-  { id: "tl", label: "Top left",     x: "15%",  y: "18%" },
-  { id: "tc", label: "Top centre",   x: "50%",  y: "12%" },
-  { id: "tr", label: "Top right",    x: "85%",  y: "18%" },
-  { id: "ml", label: "Mid left",     x: "15%",  y: "50%" },
-  { id: "mc", label: "Straight at",  x: "50%",  y: "50%" },
-  { id: "mr", label: "Mid right",    x: "85%",  y: "50%" },
-  { id: "bl", label: "Bottom left",  x: "15%",  y: "82%" },
-  { id: "bc", label: "Bottom centre",x: "50%",  y: "82%" },
-  { id: "br", label: "Bottom right", x: "85%",  y: "82%" },
-];
+/** gmQuip from shot placement in goal (0–100) + pitch position. */
+function buildGoalQuip(goalX, goalY, pitchX, pitchY) {
+  const gx = goalX ?? 50;
+  const gy = goalY ?? 50;
+  const px = pitchX ?? 50;
+  const py = pitchY ?? 50;
 
-const GOAL_QUIPS = {
-  tl: "Top left. Unsaveable.",
-  tc: "Right in the top bin.",
-  tr: "Top right. Keeper had no chance.",
-  ml: "Mid left. Placed.",
-  mc: "Straight at the keeper. Got lucky.",
-  mr: "Mid right. Clean finish.",
-  bl: "Bottom left. Rolled in.",
-  bc: "Low and central. Under him.",
-  br: "Bottom right. Slid in.",
-};
+  const isTop = gy < 35;
+  const isBottom = gy > 65;
+  const isLeft = gx < 30;
+  const isRight = gx > 70;
+  const isHorizMid = gx >= 30 && gx <= 70;
+
+  let core;
+  if (isTop && isLeft) core = "Top left corner.";
+  else if (isTop && isRight) core = "Top right corner.";
+  else if (isTop && isHorizMid) core = "Top centre.";
+  else if (isBottom && isLeft) core = "Bottom left.";
+  else if (isBottom && isRight) core = "Bottom right.";
+  else if (isBottom && isHorizMid) core = "Bottom centre.";
+  else if (!isTop && !isBottom && isLeft) core = "Middle left.";
+  else if (!isTop && !isBottom && isRight) core = "Middle right.";
+  else if (!isTop && !isBottom && isHorizMid) core = "Straight down the middle.";
+  else core = "Into the net.";
+
+  const extras = [];
+  if (px < 30 || px > 70) extras.push("Tight angle.");
+  if (py > 70) extras.push("Point blank.");
+
+  return extras.length ? `${core} ${extras.join(" ")}`.trim() : core;
+}
+
+/** Goal mouth from wnf_pitch_and_goal.html: sky + striped pitch + grid net + white frame; 0–100 maps to inner goal area. */
+const GM = { vbW: 400, vbH: 150, innerX: 18, innerY: 22, innerW: 364, innerH: 94 };
+
+function goalPxToStored(cx, cy) {
+  const gx = Math.max(0, Math.min(100, ((cx - GM.innerX) / GM.innerW) * 100));
+  const gy = Math.max(0, Math.min(100, ((cy - GM.innerY) / GM.innerH) * 100));
+  return { gx, gy };
+}
+
+function storedToGoalPx(gx, gy) {
+  return {
+    cx: GM.innerX + (gx / 100) * GM.innerW,
+    cy: GM.innerY + (gy / 100) * GM.innerH,
+  };
+}
+
+function GoalmouthSVG({ dot, onGoalTap }) {
+  const handlePointer = (e) => {
+    const svg = e.currentTarget;
+    const rect = svg.getBoundingClientRect();
+    const cx = ((e.clientX - rect.left) / rect.width) * GM.vbW;
+    const cy = ((e.clientY - rect.top) / rect.height) * GM.vbH;
+    const { gx, gy } = goalPxToStored(cx, cy);
+    onGoalTap(gx, gy);
+  };
+
+  const showDot = dot != null && dot.x != null && dot.y != null;
+  const { cx: dotCx, cy: dotCy } = showDot ? storedToGoalPx(dot.x, dot.y) : { cx: -99, cy: -99 };
+
+  const netVertXs = [62, 106, 150, 194, 238, 282, 326, 370];
+  const pitchStripeXs = [0, 100, 200, 300];
+
+  return (
+    <div className="goalmouth-stage">
+      <div className="goalmouth-wrap">
+        <svg
+          className="goalmouth-svg"
+          viewBox={`0 0 ${GM.vbW} ${GM.vbH}`}
+          preserveAspectRatio="xMidYMid meet"
+          onClick={handlePointer}
+          role="img"
+          aria-label="Tap where the ball went in the goal"
+        >
+          <rect width={GM.vbW} height={GM.vbH} fill="#7ab8d4" />
+          <rect y="108" width={GM.vbW} height="42" fill="#2e8b3a" />
+          {pitchStripeXs.map((x) => (
+            <rect key={x} y="108" x={x} width="50" height="42" fill="#287834" opacity={0.5} />
+          ))}
+          <line x1="0" y1="116" x2="400" y2="116" stroke="rgba(255,255,255,0.7)" strokeWidth="2" />
+          <rect x="18" y="28" width="364" height="88" fill="#0d2010" />
+          {netVertXs.map((x) => (
+            <line key={x} x1={x} y1="28" x2={x} y2="116" stroke="rgba(255,255,255,0.15)" strokeWidth="0.8" />
+          ))}
+          <line x1="18" y1="50" x2="382" y2="50" stroke="rgba(255,255,255,0.15)" strokeWidth="0.8" />
+          <line x1="18" y1="72" x2="382" y2="72" stroke="rgba(255,255,255,0.15)" strokeWidth="0.8" />
+          <line x1="18" y1="94" x2="382" y2="94" stroke="rgba(255,255,255,0.15)" strokeWidth="0.8" />
+          <rect x="10" y="24" width="8" height="92" rx="3" fill="#f0f0f0" />
+          <rect x="382" y="24" width="8" height="92" rx="3" fill="#f0f0f0" />
+          <rect x="10" y="22" width="380" height="8" rx="3" fill="#f0f0f0" />
+          <rect x="10" y="114" width="380" height="4" rx="2" fill="rgba(220,220,220,0.6)" />
+          {showDot && (
+            <>
+              <circle cx={dotCx} cy={dotCy} r="22" fill="#f0c040" opacity={0.2} />
+              <circle
+                cx={dotCx}
+                cy={dotCy}
+                r="10"
+                fill="#f0c040"
+                stroke="#fff"
+                strokeWidth="2.5"
+              />
+            </>
+          )}
+        </svg>
+      </div>
+    </div>
+  );
+}
 
 const BANTER_LINES = {
   topScorer: (name, n) => `🔥 ${name} is on a tear — ${n} goals this season. Someone please mark him.`,
@@ -104,6 +191,26 @@ const defaultState = {
   logStep: null, // null | "pitch" | "goalmouth" | "how"
   logData: {},
 };
+
+/** Merge saved localStorage with defaults so a bad/corrupt snapshot never crashes the first render. */
+function sanitizeAppState(raw) {
+  if (!raw || typeof raw !== "object") return { ...defaultState };
+  return {
+    ...defaultState,
+    ...raw,
+    season: normalizeSeason(raw.season),
+    currentMatch:
+      raw.currentMatch != null && typeof raw.currentMatch === "object"
+        ? raw.currentMatch
+        : null,
+    view: typeof raw.view === "string" ? raw.view : defaultState.view,
+    logStep: raw.logStep === null || typeof raw.logStep === "string" ? raw.logStep : null,
+    logData:
+      raw.logData && typeof raw.logData === "object" && !Array.isArray(raw.logData)
+        ? raw.logData
+        : {},
+  };
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function initials(name) {
@@ -237,15 +344,17 @@ body{font-family:'Figtree',sans-serif;background:#f5f5f0;min-height:100vh;color:
 .how-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .how-btn{padding:12px;border-radius:12px;border:1px solid #e8e8e8;background:#fff;font-family:'Figtree',sans-serif;font-size:13px;font-weight:600;cursor:pointer;text-align:left;transition:border-color 0.15s}
 .how-btn:hover{border-color:#111;background:#f9f9f9}
-.goalmouth-wrap{position:relative;width:100%;padding-bottom:55%;background:#1a1a1a;border-radius:14px;overflow:hidden;border:3px solid #444}
-.gm-post{position:absolute;background:#fff;border-radius:2px}
-.gm-left{left:0;top:0;width:4px;height:100%}
-.gm-right{right:0;top:0;width:4px;height:100%}
-.gm-top{top:0;left:0;right:0;height:4px}
-.gm-net{position:absolute;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 14%,rgba(255,255,255,0.06) 14%,rgba(255,255,255,0.06) 15%),repeating-linear-gradient(90deg,transparent,transparent 10%,rgba(255,255,255,0.06) 10%,rgba(255,255,255,0.06) 11%)}
-.gm-zone{position:absolute;transform:translate(-50%,-50%);width:28%;height:24%;border-radius:8px;background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.15);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:rgba(255,255,255,0.5);transition:background 0.15s}
-.gm-zone:hover{background:rgba(255,255,255,0.2);color:#fff}
-.gm-zone.selected{background:rgba(240,192,64,0.4);border-color:#f0c040;color:#f0c040}
+.goalmouth-stage{width:100%;padding:4px 0 10px}
+.goalmouth-wrap{position:relative;width:100%;height:0;padding-bottom:37.5%;border-radius:14px;overflow:hidden;border:2px solid #e0e0e0;box-shadow:0 1px 3px rgba(0,0,0,0.06)}
+.goalmouth-svg{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:crosshair;touch-action:manipulation;border-radius:12px}
+.goalmouth-hint{font-size:12px;color:#999;text-align:center;margin-top:10px}
+.squad-pick-list{display:flex;flex-direction:column;gap:0}
+.squad-pick-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:0.5px solid #f0f0f0}
+.squad-pick-row:last-child{border-bottom:none}
+.squad-pick-actions{display:flex;gap:8px;flex-shrink:0}
+.squad-pick-name{font-size:14px;font-weight:600;color:#111;flex:1;min-width:0}
+.guest-add-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px}
+.guest-add-row .form-input{flex:1;min-width:140px}
 .back-btn{display:flex;align-items:center;gap:6px;background:none;border:none;font-family:'Figtree',sans-serif;font-size:14px;font-weight:600;color:#555;cursor:pointer;padding:0;margin-bottom:4px}
 .step-indicator{display:flex;gap:6px;align-items:center;margin-bottom:16px}
 .step-dot{width:6px;height:6px;border-radius:50%;background:#e0e0e0}
@@ -272,7 +381,7 @@ body{font-family:'Figtree',sans-serif;background:#f5f5f0;min-height:100vh;color:
 
 // ── App ───────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [state, setState] = useState(() => loadLocal() ?? defaultState);
+  const [state, setState] = useState(() => sanitizeAppState(loadLocal() ?? defaultState));
 
   useEffect(() => {
     saveLocal(state);
@@ -357,16 +466,44 @@ export default function App() {
     const rect = svg.getBoundingClientRect();
     const x = ((e.clientX - rect.left) / rect.width) * 100;
     const y = ((e.clientY - rect.top) / rect.height) * 100;
-    update(() => ({ logStep: "goalmouth", logData: { ...logData, pitchX: x, pitchY: y } }));
+    update((prev) => ({
+      logStep: "goalmouth",
+      logData: { ...prev.logData, pitchX: x, pitchY: y },
+    }));
   };
 
-  const handleGoalmouthSelect = (zone) => {
-    update(() => ({ logStep: "how", logData: { ...logData, zone } }));
+  const handleGoalTap = (goalX, goalY) => {
+    let applied = false;
+    setState((prev) => {
+      if (prev.logStep !== "goalmouth" || prev.logData._showGoalDot) return prev;
+      applied = true;
+      return {
+        ...prev,
+        logData: { ...prev.logData, goalX, goalY, _showGoalDot: true },
+      };
+    });
+    if (applied) {
+      window.setTimeout(() => {
+        setState((prev) => {
+          if (prev.logStep !== "goalmouth") return prev;
+          return {
+            ...prev,
+            logStep: "how",
+            logData: { ...prev.logData, _showGoalDot: false },
+          };
+        });
+      }, 200);
+    }
   };
 
   const handleHowSelect = (how) => {
     const howOpt = HOW_OPTIONS.find(h => h.value === how);
-    const gmQuip = GOAL_QUIPS[logData.zone?.id] || "";
+    const gmQuip = buildGoalQuip(
+      logData.goalX,
+      logData.goalY,
+      logData.pitchX,
+      logData.pitchY
+    );
     const isOG = how === "own_goal";
     const event = {
       id: crypto.randomUUID(),
@@ -374,7 +511,8 @@ export default function App() {
       how,
       team: logData.team || 1,
       player: logData.player || null,
-      zone: logData.zone,
+      goalX: logData.goalX,
+      goalY: logData.goalY,
       pitchX: logData.pitchX,
       pitchY: logData.pitchY,
       quip: howOpt?.quip || "",
@@ -556,38 +694,64 @@ export default function App() {
 
   // NEW MATCH SETUP
   const NewMatch = () => {
-    const [localTeam1, setLocalTeam1] = useState(currentMatch?.team1 || { name: "Bibs", color: "#f59e0b", players: [] });
-    const [localTeam2, setLocalTeam2] = useState(currentMatch?.team2 || { name: "Skins", color: "#3b82f6", players: [] });
-    const [input1, setInput1] = useState("");
-    const [input2, setInput2] = useState("");
-    const [bulk, setBulk] = useState("");
+    const [lineup, setLineup] = useState(() => ({
+      team1: currentMatch?.team1 || { name: "Bibs", color: "#f59e0b", players: [] },
+      team2: currentMatch?.team2 || { name: "Skins", color: "#3b82f6", players: [] },
+    }));
+    const [guestInp, setGuestInp] = useState("");
 
-    const addP = (team, name) => {
-      if (!name.trim()) return;
-      if (team === 1) { setLocalTeam1(t => ({ ...t, players: [...t.players, name.trim()] })); setInput1(""); }
-      else { setLocalTeam2(t => ({ ...t, players: [...t.players, name.trim()] })); setInput2(""); }
+    const localTeam1 = lineup.team1;
+    const localTeam2 = lineup.team2;
+
+    const assignedSet = useMemo(
+      () => new Set([...lineup.team1.players, ...lineup.team2.players]),
+      [lineup.team1.players, lineup.team2.players]
+    );
+    const squadAvailable = useMemo(
+      () => season.players.filter((p) => !assignedSet.has(p)),
+      [season.players, assignedSet]
+    );
+
+    const addToTeam = (teamNum, rawName) => {
+      const name = rawName.trim();
+      if (!name) return;
+      setLineup((prev) => {
+        const all = [...prev.team1.players, ...prev.team2.players];
+        if (all.includes(name)) return prev;
+        const key = teamNum === 1 ? "team1" : "team2";
+        return {
+          ...prev,
+          [key]: { ...prev[key], players: [...prev[key].players, name] },
+        };
+      });
     };
-    const removeP = (team, i) => {
-      if (team === 1) setLocalTeam1(t => ({ ...t, players: t.players.filter((_,j) => j!==i) }));
-      else setLocalTeam2(t => ({ ...t, players: t.players.filter((_,j) => j!==i) }));
+
+    const removeP = (teamNum, i) => {
+      const key = teamNum === 1 ? "team1" : "team2";
+      setLineup((prev) => ({
+        ...prev,
+        [key]: { ...prev[key], players: prev[key].players.filter((_, j) => j !== i) },
+      }));
     };
-    const bulkAdd = () => {
-      const names = bulk.split(",").map(n=>n.trim()).filter(Boolean);
-      const half = Math.ceil(names.length / 2);
-      setLocalTeam1(t => ({ ...t, players: [...t.players, ...names.slice(0, half)] }));
-      setLocalTeam2(t => ({ ...t, players: [...t.players, ...names.slice(half)] }));
-      setBulk("");
-    };
+
     const randomise = () => {
-      const all = [...localTeam1.players, ...localTeam2.players];
-      for (let i = all.length-1; i>0; i--) { const j=Math.floor(Math.random()*(i+1)); [all[i],all[j]]=[all[j],all[i]]; }
-      const half = Math.ceil(all.length/2);
-      setLocalTeam1(t => ({ ...t, players: all.slice(0, half) }));
-      setLocalTeam2(t => ({ ...t, players: all.slice(half) }));
+      setLineup((prev) => {
+        const all = [...prev.team1.players, ...prev.team2.players];
+        for (let i = all.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [all[i], all[j]] = [all[j], all[i]];
+        }
+        const half = Math.ceil(all.length / 2);
+        return {
+          team1: { ...prev.team1, players: all.slice(0, half) },
+          team2: { ...prev.team2, players: all.slice(half) },
+        };
+      });
     };
+
     const proceed = () => {
       update(() => ({
-        currentMatch: { ...currentMatch, team1: localTeam1, team2: localTeam2, status: "live" },
+        currentMatch: { ...currentMatch, team1: lineup.team1, team2: lineup.team2, status: "live" },
         view: "live",
       }));
     };
@@ -600,54 +764,85 @@ export default function App() {
         <div style={{ fontWeight: 900, fontSize: 22, marginBottom: 16 }}>Set up teams</div>
 
         <div className="card card-sm" style={{ marginBottom: 10 }}>
-          <div className="section-label">Bulk add players</div>
-          <div style={{ display: "flex", gap: 8 }}>
+          <div className="section-label">Squad</div>
+          {season.players.length === 0 ? (
+            <div style={{ fontSize: 13, color: "#999", marginBottom: 8 }}>
+              No one in your squad yet — add names in the Squad tab, or use a guest below.
+            </div>
+          ) : squadAvailable.length === 0 ? (
+            <div style={{ fontSize: 13, color: "#999" }}>Everyone from your squad is on a team. Remove someone to reassign, or add a guest.</div>
+          ) : (
+            <div className="squad-pick-list">
+              {squadAvailable.map((name) => (
+                <div className="squad-pick-row" key={name}>
+                  <span className="squad-pick-name">{name}</span>
+                  <div className="squad-pick-actions">
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => addToTeam(1, name)}>
+                      {localTeam1.name}
+                    </button>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => addToTeam(2, name)}>
+                      {localTeam2.name}
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="section-label" style={{ marginTop: 14 }}>Add guest (not in squad)</div>
+          <div className="guest-add-row">
             <input
-              className="form-input" style={{ flex: 1 }}
-              placeholder="Dave, Steve, Marcus, Jordan..."
-              value={bulk} onChange={e => setBulk(e.target.value)}
-              onKeyDown={e => e.key === "Enter" && bulkAdd()}
+              className="form-input"
+              style={{ padding: "8px 12px", fontSize: 13 }}
+              placeholder="Guest name..."
+              value={guestInp}
+              onChange={(e) => setGuestInp(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  addToTeam(1, guestInp);
+                  setGuestInp("");
+                }
+              }}
             />
-            <button className="btn btn-ghost btn-sm" onClick={bulkAdd}>Add</button>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => { addToTeam(1, guestInp); setGuestInp(""); }}>
+              → {localTeam1.name}
+            </button>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => { addToTeam(2, guestInp); setGuestInp(""); }}>
+              → {localTeam2.name}
+            </button>
           </div>
-          <button className="btn btn-ghost btn-sm" style={{ marginTop: 8 }} onClick={randomise}>
+          <button className="btn btn-ghost btn-sm" style={{ marginTop: 10 }} onClick={randomise}>
             🎲 Randomise teams
           </button>
         </div>
 
         <div className="teams-grid">
-          {[1,2].map(t => {
-            const team = t===1 ? localTeam1 : localTeam2;
-            const setTeam = t===1 ? setLocalTeam1 : setLocalTeam2;
-            const inp = t===1 ? input1 : input2;
-            const setInp = t===1 ? setInput1 : setInput2;
+          {[1, 2].map((t) => {
+            const team = t === 1 ? localTeam1 : localTeam2;
+            const tk = t === 1 ? "team1" : "team2";
             return (
               <div className="card card-sm" key={t}>
                 <div className="team-label">
                   <div className="team-dot" style={{ background: team.color }} />
                   <input
                     value={team.name}
-                    onChange={e => setTeam(tm => ({ ...tm, name: e.target.value }))}
+                    onChange={(e) =>
+                      setLineup((prev) => ({
+                        ...prev,
+                        [tk]: { ...prev[tk], name: e.target.value },
+                      }))
+                    }
                     style={{ background: "none", border: "none", fontFamily: "inherit", fontWeight: 800, fontSize: 14, width: "100%", outline: "none", color: "#111" }}
                   />
                 </div>
                 <div className="player-list">
                   {team.players.length === 0 && <div style={{ fontSize: 12, color: "#bbb", padding: "4px 0" }}>No players yet</div>}
                   {team.players.map((p, i) => (
-                    <div className="player-tag" key={i}>
+                    <div className="player-tag" key={`${p}-${i}`}>
                       <span>{p}</span>
-                      <button onClick={() => removeP(t, i)}>×</button>
+                      <button type="button" onClick={() => removeP(t, i)}>×</button>
                     </div>
                   ))}
-                </div>
-                <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
-                  <input
-                    className="form-input" style={{ flex: 1, padding: "7px 10px", fontSize: 13 }}
-                    placeholder="Add player..."
-                    value={inp} onChange={e => setInp(e.target.value)}
-                    onKeyDown={e => e.key === "Enter" && addP(t, inp)}
-                  />
-                  <button className="btn btn-ghost btn-sm" onClick={() => addP(t, inp)}>+</button>
                 </div>
               </div>
             );
@@ -657,6 +852,79 @@ export default function App() {
         <button className="btn btn-primary" onClick={proceed} style={{ marginTop: 4 }}>
           Kick off →
         </button>
+      </>
+    );
+  };
+
+  const addSquadPlayer = (raw) => {
+    const name = raw.trim();
+    if (!name) return;
+    setState((prev) => {
+      if (prev.season.players.includes(name)) return prev;
+      const nextSeason = { ...prev.season, players: [...prev.season.players, name] };
+      upsertSeasonToSupabase(nextSeason).catch((e) => {
+        console.warn("Supabase save failed; squad kept in local storage", e);
+      });
+      return { ...prev, season: nextSeason };
+    });
+  };
+
+  const removeSquadPlayer = (name) => {
+    setState((prev) => {
+      const nextSeason = { ...prev.season, players: prev.season.players.filter((p) => p !== name) };
+      upsertSeasonToSupabase(nextSeason).catch((e) => {
+        console.warn("Supabase save failed; squad kept in local storage", e);
+      });
+      return { ...prev, season: nextSeason };
+    });
+  };
+
+  const Squad = () => {
+    const [addInp, setAddInp] = useState("");
+    return (
+      <>
+        <div className="topbar">
+          <div className="topbar-logo">Squad 👥</div>
+          <div className="topbar-week">Roster</div>
+        </div>
+        <div className="card card-sm">
+          <div className="section-label">Add player</div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              className="form-input"
+              style={{ flex: 1 }}
+              placeholder="Name..."
+              value={addInp}
+              onChange={(e) => setAddInp(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  addSquadPlayer(addInp);
+                  setAddInp("");
+                }
+              }}
+            />
+            <button type="button" className="btn btn-primary btn-sm" style={{ width: "auto" }} onClick={() => { addSquadPlayer(addInp); setAddInp(""); }}>
+              Add
+            </button>
+          </div>
+        </div>
+        <div className="card card-sm">
+          <div className="section-label">Saved players</div>
+          {season.players.length === 0 ? (
+            <div className="empty-state">No players saved yet.</div>
+          ) : (
+            <div className="player-list">
+              {season.players.map((name) => (
+                <div className="player-tag" key={name}>
+                  <span>{name}</span>
+                  <button type="button" onClick={() => removeSquadPlayer(name)} aria-label={`Remove ${name}`}>
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </>
     );
   };
@@ -779,22 +1047,15 @@ export default function App() {
         {logStep === "goalmouth" && (
           <div className="card card-sm">
             <div className="section-label">Where did it go in?</div>
-            <div className="goalmouth-wrap">
-              <div className="gm-net" />
-              <div className="gm-post gm-left" />
-              <div className="gm-post gm-right" />
-              <div className="gm-post gm-top" />
-              {GOALMOUTH.map(z => (
-                <button
-                  key={z.id}
-                  className={`gm-zone ${logData.zone?.id === z.id ? "selected" : ""}`}
-                  style={{ left: z.x, top: z.y }}
-                  onClick={() => handleGoalmouthSelect(z)}
-                >
-                  {z.label.split(" ")[0]}
-                </button>
-              ))}
-            </div>
+            <GoalmouthSVG
+              dot={
+                logData._showGoalDot && logData.goalX != null && logData.goalY != null
+                  ? { x: logData.goalX, y: logData.goalY }
+                  : null
+              }
+              onGoalTap={handleGoalTap}
+            />
+            <div className="goalmouth-hint">Tap where it went in</div>
           </div>
         )}
 
@@ -952,6 +1213,7 @@ export default function App() {
         {view === "dashboard" && <Dashboard />}
         {view === "new_match" && <NewMatch />}
         {view === "live" && <LiveMatch />}
+        {view === "squad" && <Squad />}
         {view === "history" && <History />}
       </div>
 
@@ -964,6 +1226,9 @@ export default function App() {
           <button className={`nav-btn ${(view === "live" || view === "new_match") ? "active" : ""}`}
             onClick={() => currentMatch ? update(() => ({ view: "live" })) : startNewMatch()}>
             <span className="nav-icon">⚽</span>Match
+          </button>
+          <button className={`nav-btn ${view === "squad" ? "active" : ""}`} onClick={() => update(() => ({ view: "squad" }))}>
+            <span className="nav-icon">👤</span>Squad
           </button>
           <button className={`nav-btn ${view === "history" ? "active" : ""}`} onClick={() => update(() => ({ view: "history" }))}>
             <span className="nav-icon">📋</span>History

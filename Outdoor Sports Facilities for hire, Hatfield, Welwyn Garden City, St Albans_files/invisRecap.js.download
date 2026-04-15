@@ -1,0 +1,22 @@
+var reCapLoaded = false;
+function loadReCap() {
+	if(reCapLoaded===true) {
+		return;
+	}
+	reCapLoaded = true;
+
+	$.getScript( "https://www.google.com/recaptcha/api.js?onload=recapOnloadCallback&render=explicit" );
+}
+
+function recapOnloadCallback() {
+	$(".g-recaptcha").each(function() {
+		var object = $(this);
+		grecaptcha.render(object.attr("id"), {
+		    "sitekey" : recapPubKey,
+		    "callback" : function(token) {
+			object.parents('form').find(".g-recaptcha-response").val(token);
+			object.parents('form').submit();
+		    }
+		});
+	});
+}

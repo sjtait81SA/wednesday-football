@@ -1,0 +1,19 @@
+$(document).ready(function () {
+    
+    $('.eProtection').click(function () {	
+	// gets the reversed email address
+	var reverselink = $(this).html();
+	try {
+	    // reverses the link letter by letter
+	    var link = reverselink.split("").reverse().join("");
+	    
+	    // sets the href of the anchor
+	    $(this).attr("href", "mailto:" + link);
+	} catch (err) {
+	    console.log(link);	    	    	    
+	};
+    });
+});
+
+
+
