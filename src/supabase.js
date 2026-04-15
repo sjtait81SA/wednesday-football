@@ -9,4 +9,11 @@ function isHttpUrl(s) {
 }
 
 export const supabase =
-  isHttpUrl(url) && anonKey ? createClient(url.trim(), anonKey) : null;
+  isHttpUrl(url) && anonKey
+    ? createClient(url.trim(), anonKey, {
+        auth: {
+          detectSessionInUrl: true,
+          flowType: "pkce",
+        },
+      })
+    : null;

@@ -1,5 +1,41 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { supabase } from "./supabase.js";
+import { ACHIEVEMENT_META } from "./achievementsEngine.js";
+import {
+  sendMagicLinkEmail,
+  signOut,
+  fetchMyPlayer,
+  fetchUnclaimedPlayersForSquad,
+  claimPlayerRow,
+  insertPlayerRow,
+  processAchievementsForSavedMatch,
+  fetchAchievementsForPlayer,
+  fetchLatestAchievementFeed,
+  syncSquadNamesToPlayers,
+  fetchPlayerByName,
+  seedPlayersIfEmpty,
+} from "./authApi.js";
+import { buildInitialSeason } from "./squad.js";
+
+const WNF_PENDING_AUTH_KEY = "wnf-pending-auth";
+
+function readAndClearPendingAuth() {
+  try {
+    const raw = sessionStorage.getItem(WNF_PENDING_AUTH_KEY);
+    if (raw) sessionStorage.removeItem(WNF_PENDING_AUTH_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writePendingAuth(payload) {
+  try {
+    sessionStorage.setItem(WNF_PENDING_AUTH_KEY, JSON.stringify(payload));
+  } catch {
+    /* ignore */
+  }
+}
 
 // ── Storage (local fallback when Supabase is unavailable) ───────────────────
 const SK = "wnf-v2";
@@ -190,11 +226,38 @@ const defaultState = {
   view: "dashboard",
   logStep: null, // null | "pitch" | "goalmouth" | "how"
   logData: {},
+  playerProfileName: null,
 };
+
+/** First visit (no localStorage): real squad + one demo match. */
+function createInitialClientState() {
+  return {
+    ...defaultState,
+    season: normalizeSeason(buildInitialSeason()),
+  };
+}
+
+const ALLOWED_VIEWS = [
+  "dashboard",
+  "new_match",
+  "live",
+  "squad",
+  "history",
+  "profile",
+  "player_profile",
+  "account",
+];
 
 /** Merge saved localStorage with defaults so a bad/corrupt snapshot never crashes the first render. */
 function sanitizeAppState(raw) {
   if (!raw || typeof raw !== "object") return { ...defaultState };
+  const playerProfileName =
+    typeof raw.playerProfileName === "string" ? raw.playerProfileName : null;
+  let view =
+    typeof raw.view === "string" && ALLOWED_VIEWS.includes(raw.view)
+      ? raw.view
+      : defaultState.view;
+  if (view === "player_profile" && !playerProfileName) view = defaultState.view;
   return {
     ...defaultState,
     ...raw,
@@ -203,7 +266,8 @@ function sanitizeAppState(raw) {
       raw.currentMatch != null && typeof raw.currentMatch === "object"
         ? raw.currentMatch
         : null,
-    view: typeof raw.view === "string" ? raw.view : defaultState.view,
+    view,
+    playerProfileName,
     logStep: raw.logStep === null || typeof raw.logStep === "string" ? raw.logStep : null,
     logData:
       raw.logData && typeof raw.logData === "object" && !Array.isArray(raw.logData)
@@ -216,6 +280,7 @@ function sanitizeAppState(raw) {
 function initials(name) {
   return name.split(" ").map(w => w[0]).join("").toUpperCase().slice(0,2);
 }
+
 function fmtDate(iso) {
   if (!iso) return "";
   return new Date(iso).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
@@ -265,12 +330,43 @@ function seasonOGs(season) {
   return Object.entries(ogs).sort((a,b) => b[1]-a[1]);
 }
 
+function playerSeasonStats(season, playerName) {
+  const p = (playerName || "").trim();
+  if (!p) return { goals: 0, ogs: 0, apps: 0 };
+  let goals = 0;
+  let ogs = 0;
+  let apps = 0;
+  season.matches.forEach((m) => {
+    const roster = new Set([
+      ...(m.team1?.players || []),
+      ...(m.team2?.players || []),
+    ].map((x) => (x || "").trim()));
+    if (roster.has(p)) apps += 1;
+    (m.events || []).forEach((ev) => {
+      if (ev.type !== "goal" || (ev.player || "").trim() !== p) return;
+      if (ev.isOG || ev.how === "own_goal") ogs += 1;
+      else goals += 1;
+    });
+  });
+  return { goals, ogs, apps };
+}
+
 // ── Styles (injected) ─────────────────────────────────────────────────────────
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800;900&display=swap');
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Figtree',sans-serif;background:#f5f5f0;min-height:100vh;color:#111}
-.app{max-width:480px;margin:0 auto;padding:16px;padding-bottom:80px;display:flex;flex-direction:column;gap:12px}
+.app{max-width:min(1100px,100%);margin:0 auto;padding:16px;padding-bottom:80px;display:flex;flex-direction:column;gap:12px}
+.dashboard-grid{display:grid;grid-template-columns:1fr;gap:10px}
+@media (min-width:700px){
+  .dashboard-grid{grid-template-columns:3fr 2fr;align-items:start}
+  .sidebar{display:flex;flex-direction:column;gap:10px}
+}
+.main-col{display:flex;flex-direction:column;gap:10px}
+.dashboard-mini-stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.dashboard-mini-stat{text-align:center;padding:12px 8px!important}
+.dashboard-mini-stat-val{font-size:22px;font-weight:900;color:#111;line-height:1.1}
+.dashboard-mini-stat-lbl{font-size:10px;font-weight:700;color:#999;text-transform:uppercase;letter-spacing:0.5px;margin-top:6px}
 .topbar{display:flex;align-items:center;justify-content:space-between;padding:4px 0 8px}
 .topbar-logo{font-size:20px;font-weight:900;letter-spacing:-0.5px;color:#111}
 .topbar-week{font-size:12px;color:#777;background:#fff;padding:4px 12px;border-radius:20px;border:0.5px solid #e0e0e0}
@@ -377,25 +473,116 @@ body{font-family:'Figtree',sans-serif;background:#f5f5f0;min-height:100vh;color:
 .live-score{font-size:40px;font-weight:900;min-width:50px;text-align:center}
 .shot-marker{cursor:pointer}
 .shot-marker:hover circle{stroke:#e24b4a;stroke-width:0.8}
+.stat-row--me{background:#f0f7ff;border-radius:10px;padding:6px 8px;margin:-6px -8px 2px}
+.stat-row--me .stat-name{color:#0c447c}
+.auth-screen{min-height:70vh;display:flex;flex-direction:column;justify-content:center;gap:16px;max-width:400px;margin:0 auto;padding:24px 16px}
+.auth-title{font-size:28px;font-weight:900;letter-spacing:-0.5px;text-align:center}
+.auth-card{background:#fff;border-radius:18px;border:0.5px solid #e8e8e8;padding:20px}
+.auth-hint{font-size:12px;color:#888;text-align:center;margin-top:8px}
+.auth-err{font-size:13px;color:#c0392b;text-align:center;margin-top:8px}
+.claim-list{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+.claim-row{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-radius:12px;border:1px solid #e8e8e8;background:#fff;font-size:15px;font-weight:600;cursor:pointer;text-align:left;width:100%;font-family:inherit}
+.claim-row:disabled{opacity:0.6;cursor:not-allowed}
+.claim-row:not(:disabled):active{background:#f5f5f0}
+.topbar-user{display:flex;align-items:center;gap:8px}
+.avatar-btn{width:36px;height:36px;border-radius:50%;border:2px solid #e8e8e8;background:#e6f1fb;color:#0c447c;font-size:11px;font-weight:800;cursor:pointer;padding:0;display:flex;align-items:center;justify-content:center}
+.avatar-btn:active{opacity:0.85}
+.ach-feed-card{background:linear-gradient(135deg,#fff9e6 0%,#fff 100%);border:1px solid #f0e6c8;border-radius:14px;padding:14px 16px;margin-bottom:10px;display:flex;gap:12px;align-items:flex-start}
+.ach-feed-emoji{font-size:28px;line-height:1}
+.ach-feed-text{font-size:14px;color:#333;line-height:1.4}
+.ach-feed-text strong{font-weight:800}
+.profile-badges{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.ach-badge{font-size:26px;line-height:1;padding:8px 10px;border-radius:12px;background:#f5f5f0;border:1px solid #e8e8e8;cursor:default}
+.toast-mini{position:fixed;bottom:88px;left:50%;transform:translateX(-50%);background:#111;color:#fff;padding:10px 16px;border-radius:12px;font-size:13px;font-weight:600;z-index:200;max-width:90%;text-align:center;box-shadow:0 4px 20px rgba(0,0,0,0.15)}
+.btn:disabled{opacity:0.45;cursor:not-allowed}
+.stat-row--click{cursor:pointer;border-radius:10px;transition:background 0.15s}
+.stat-row--click:hover{background:#fafafa}
+.auth-sheet-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:300;display:flex;align-items:flex-end;justify-content:center}
+.auth-sheet-backdrop--center{align-items:center;justify-content:center;padding:24px}
+.auth-sheet{width:100%;max-width:440px;background:#fff;border-radius:20px 20px 0 0;padding:20px 20px 28px;box-shadow:0 -8px 40px rgba(0,0,0,0.12);max-height:85vh;overflow:auto}
+.auth-sheet--modal{border-radius:20px;margin:0 auto}
+.auth-sheet-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px}
+.auth-sheet-title{font-size:20px;font-weight:900;letter-spacing:-0.3px;color:#111}
+.auth-sheet-sub{font-size:14px;color:#666;line-height:1.45;margin-bottom:16px}
+.auth-sheet-close{width:36px;height:36px;border:none;background:#f5f5f0;border-radius:10px;font-size:20px;line-height:1;cursor:pointer;color:#666;flex-shrink:0}
+.auth-sheet-close:hover{background:#ebebeb}
+.topbar-link{background:none;border:none;font-size:13px;font-weight:600;color:#888;cursor:pointer;padding:6px 4px;font-family:inherit;text-decoration:underline;text-underline-offset:3px}
+.topbar-link:hover{color:#111}
 `;
 
 // ── App ───────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [state, setState] = useState(() => sanitizeAppState(loadLocal() ?? defaultState));
+  const [state, setState] = useState(() => sanitizeAppState(loadLocal() ?? createInitialClientState()));
+  const [session, setSession] = useState(null);
+  const [myPlayer, setMyPlayer] = useState(null);
+  const [authModal, setAuthModal] = useState({ open: false, subtitle: "" });
+  const [claimSheetOpen, setClaimSheetOpen] = useState(false);
+  /** When opening sign-in: `{ kind, meta }` written to sessionStorage after magic link is sent. */
+  const pendingAuthRef = useRef(null);
+  const [magicLinkStep, setMagicLinkStep] = useState("email");
+  const [emailInput, setEmailInput] = useState("");
+  const [authErr, setAuthErr] = useState("");
+  const [claimLoading, setClaimLoading] = useState(false);
+  const [guestClaimName, setGuestClaimName] = useState("");
+  const [unclaimedList, setUnclaimedList] = useState([]);
+  const [latestAchNotif, setLatestAchNotif] = useState(null);
+  const [profileAch, setProfileAch] = useState([]);
+  const [toastMsg, setToastMsg] = useState("");
 
   useEffect(() => {
     saveLocal(state);
   }, [state]);
 
   useEffect(() => {
+    if (!supabase) {
+      return;
+    }
+    let cancelled = false;
+    supabase.auth.getSession().then(({ data: { session: s } }) => {
+      if (!cancelled) {
+        setSession(s ?? null);
+      }
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_e, s) => {
+      setSession(s ?? null);
+    });
+    return () => {
+      cancelled = true;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!supabase) return;
+    seedPlayersIfEmpty(supabase);
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
     (async () => {
+      if (!supabase || !session?.user) {
+        setMyPlayer(null);
+        return;
+      }
+      const row = await fetchMyPlayer(supabase);
+      if (cancelled) return;
+      setMyPlayer(row ?? null);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.user?.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!supabase) return;
       try {
         const remote = await fetchSeasonFromSupabase();
         if (cancelled || remote == null) return;
         setState((prev) => ({ ...prev, season: remote }));
       } catch (e) {
-        console.warn("Supabase load failed; using local cache", e);
+        console.warn("Supabase season load failed; using local cache", e);
       }
     })();
     return () => {
@@ -403,25 +590,104 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!supabase) return;
+      const row = await fetchLatestAchievementFeed(supabase);
+      if (!cancelled) setLatestAchNotif(row);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [state.season?.matches?.length]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!supabase || !myPlayer?.id) {
+        setProfileAch([]);
+        return;
+      }
+      const rows = await fetchAchievementsForPlayer(supabase, myPlayer.id);
+      if (!cancelled) setProfileAch(rows);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [myPlayer?.id, session]);
+
   const update = (fn) => setState(prev => ({ ...prev, ...fn(prev) }));
 
-  const { season, currentMatch, view, logStep, logData } = state;
+  const { season, currentMatch, view, logStep, logData, playerProfileName } = state;
+  const canEdit = myPlayer?.is_admin === true;
+  const isGuest = !session?.user;
+  const isAdminUser = myPlayer?.is_admin === true;
+  const isPlayerUser = session?.user && myPlayer && !myPlayer.is_admin;
 
-  const lastMatch = season.matches[season.matches.length - 1];
-  const allGoals = useMemo(() => seasonGoals(season), [season]);
-  const allOGs = useMemo(() => seasonOGs(season), [season]);
-  const banter = useMemo(() => generateBanter(season), [season]);
-  const allPlayers = useMemo(() => {
-    const set = new Set();
-    season.players.forEach(p => set.add(p));
-    season.matches.forEach(m => {
-      [...(m.team1?.players || []), ...(m.team2?.players || [])].forEach(p => set.add(p));
+  const showToast = (msg) => {
+    setToastMsg(msg);
+    window.setTimeout(() => setToastMsg(""), 2800);
+  };
+
+  const refreshMyPlayer = async () => {
+    if (!supabase) return;
+    const row = await fetchMyPlayer(supabase);
+    setMyPlayer(row ?? null);
+  };
+
+  const closeAuthModal = () => {
+    pendingAuthRef.current = null;
+    setAuthModal({ open: false, subtitle: "" });
+    setMagicLinkStep("email");
+    setEmailInput("");
+    setAuthErr("");
+  };
+
+  /** @param pending `{ kind, meta? }` stored in sessionStorage after user requests magic link (survives redirect). */
+  const openAuthModal = (subtitle, pending = null) => {
+    pendingAuthRef.current = pending;
+    setAuthModal({ open: true, subtitle });
+    setMagicLinkStep("email");
+    setEmailInput("");
+    setAuthErr("");
+  };
+
+  const openClaimSheetFromState = () => {
+    if (!supabase) return;
+    setState((prev) => {
+      const squad = prev.season?.players || [];
+      queueMicrotask(async () => {
+        try {
+          await syncSquadNamesToPlayers(supabase, squad);
+          const rows = await fetchUnclaimedPlayersForSquad(supabase, squad);
+          setUnclaimedList(rows);
+          setClaimSheetOpen(true);
+        } catch (e) {
+          console.warn("openClaimSheet", e);
+        }
+      });
+      return prev;
     });
-    return [...set];
-  }, [season]);
+  };
 
-  // ── New match setup ──
-  const startNewMatch = () => {
+  const requestClaimProfile = () => {
+    if (!supabase) return;
+    if (!session?.user) {
+      openAuthModal("Claim your profile", { kind: "claim" });
+      return;
+    }
+    if (myPlayer) return;
+    openClaimSheetFromState();
+  };
+
+  const runAfterAdminCheck = async () => {
+    const row = await fetchMyPlayer(supabase);
+    setMyPlayer(row ?? null);
+    return row?.is_admin === true;
+  };
+
+  const beginNewMatch = () => {
     update(() => ({
       view: "new_match",
       currentMatch: {
@@ -438,16 +704,168 @@ export default function App() {
     }));
   };
 
+  const requestLogMatch = () => {
+    if (!supabase) return;
+    if (isAdminUser) {
+      beginNewMatch();
+      return;
+    }
+    if (session?.user) {
+      showToast("Only admins can log matches");
+      return;
+    }
+    openAuthModal("Log a match", { kind: "log_match" });
+  };
+
+  const requestSquadAdmin = (action, pendingPayload) => {
+    if (!supabase) return;
+    if (isAdminUser) {
+      action();
+      return;
+    }
+    if (session?.user) {
+      showToast("Only admins can change the squad");
+      return;
+    }
+    openAuthModal("Manage squad", pendingPayload);
+  };
+
+  const requestResetSeason = () => {
+    if (!supabase) return;
+    if (isAdminUser) {
+      if (!window.confirm("Reset entire season? This cannot be undone.")) return;
+      const empty = { matches: [], players: [] };
+      upsertSeasonToSupabase(empty).catch((e) => {
+        console.warn("Supabase save failed; data kept in local storage", e);
+      });
+      update(() => ({ season: empty }));
+      return;
+    }
+    if (session?.user) {
+      showToast("Only admins can reset the season");
+      return;
+    }
+    openAuthModal("Reset season", { kind: "reset_season" });
+  };
+
+  const handleSendMagicLink = async () => {
+    if (!supabase) return;
+    setAuthErr("");
+    try {
+      const origin = typeof window !== "undefined" ? window.location.origin : undefined;
+      await sendMagicLinkEmail(supabase, emailInput, origin);
+      const pending = pendingAuthRef.current;
+      if (pending?.kind) writePendingAuth(pending);
+      setMagicLinkStep("sent");
+    } catch (e) {
+      setAuthErr(e?.message || "Could not send link");
+    }
+  };
+
+  const handleLogout = async () => {
+    if (!supabase) return;
+    await signOut(supabase);
+    try {
+      sessionStorage.removeItem(WNF_PENDING_AUTH_KEY);
+    } catch {
+      /* ignore */
+    }
+    setMagicLinkStep("email");
+    setEmailInput("");
+    setAuthErr("");
+    setMyPlayer(null);
+    setUnclaimedList([]);
+    closeAuthModal();
+    update(() => ({
+      view: "dashboard",
+      currentMatch: null,
+      logStep: null,
+      logData: {},
+      playerProfileName: null,
+    }));
+  };
+
+  const handleClaimPlayer = async (playerId) => {
+    if (!supabase) return;
+    setClaimLoading(true);
+    setAuthErr("");
+    try {
+      await claimPlayerRow(supabase, playerId);
+      await refreshMyPlayer();
+      setClaimSheetOpen(false);
+    } catch (e) {
+      setAuthErr(e?.message || "Could not claim profile");
+    } finally {
+      setClaimLoading(false);
+    }
+  };
+
+  const handleAddSelfAndClaim = async () => {
+    if (!supabase) return;
+    const name = guestClaimName.trim();
+    if (!name) return;
+    setClaimLoading(true);
+    setAuthErr("");
+    try {
+      await insertPlayerRow(supabase, name, true);
+      setState((prev) => {
+        const players = prev.season.players.includes(name)
+          ? prev.season.players
+          : [...prev.season.players, name];
+        const nextSeason = { ...prev.season, players };
+        upsertSeasonToSupabase(nextSeason).catch((err) => console.warn("Season sync failed", err));
+        return { ...prev, season: nextSeason };
+      });
+      await refreshMyPlayer();
+      setGuestClaimName("");
+      setClaimSheetOpen(false);
+    } catch (e) {
+      setAuthErr(e?.message || "Could not add profile");
+    } finally {
+      setClaimLoading(false);
+    }
+  };
+
+  const lastMatch = season.matches[season.matches.length - 1];
+  const allGoals = useMemo(() => seasonGoals(season), [season]);
+  const allOGs = useMemo(() => seasonOGs(season), [season]);
+  const banter = useMemo(() => generateBanter(season), [season]);
+  const allPlayers = useMemo(() => {
+    const set = new Set();
+    season.players.forEach(p => set.add(p));
+    season.matches.forEach(m => {
+      [...(m.team1?.players || []), ...(m.team2?.players || [])].forEach(p => set.add(p));
+    });
+    return [...set];
+  }, [season]);
+
+  // ── New match setup ──
+  const startNewMatch = () => {
+    if (!canEdit) return;
+    beginNewMatch();
+  };
+
   const saveCurrentMatch = () => {
-    if (!currentMatch) return;
+    if (!currentMatch || !canEdit) return;
     setState((prev) => {
       if (!prev.currentMatch) return prev;
       const nextSeason = {
         ...prev.season,
         matches: [...prev.season.matches, prev.currentMatch],
       };
-      upsertSeasonToSupabase(nextSeason).catch((e) => {
-        console.warn("Supabase save failed; data kept in local storage", e);
+      const savedMatch = prev.currentMatch;
+      const isAdmin = myPlayer?.is_admin === true;
+      queueMicrotask(async () => {
+        try {
+          await upsertSeasonToSupabase(nextSeason);
+          if (supabase && isAdmin) {
+            await processAchievementsForSavedMatch(supabase, nextSeason, savedMatch);
+            const feed = await fetchLatestAchievementFeed(supabase);
+            setLatestAchNotif(feed);
+          }
+        } catch (e) {
+          console.warn("Save / achievements failed", e);
+        }
       });
       return {
         ...prev,
@@ -459,9 +877,13 @@ export default function App() {
   };
 
   // ── Event logging ──
-  const startLogGoal = () => update(() => ({ logStep: "pitch", logData: {} }));
+  const startLogGoal = () => {
+    if (!canEdit) return;
+    update(() => ({ logStep: "pitch", logData: {} }));
+  };
 
   const handlePitchClick = (e) => {
+    if (!canEdit) return;
     const svg = e.currentTarget;
     const rect = svg.getBoundingClientRect();
     const x = ((e.clientX - rect.left) / rect.width) * 100;
@@ -473,6 +895,7 @@ export default function App() {
   };
 
   const handleGoalTap = (goalX, goalY) => {
+    if (!canEdit) return;
     let applied = false;
     setState((prev) => {
       if (prev.logStep !== "goalmouth" || prev.logData._showGoalDot) return prev;
@@ -497,6 +920,7 @@ export default function App() {
   };
 
   const handleHowSelect = (how) => {
+    if (!canEdit) return;
     const howOpt = HOW_OPTIONS.find(h => h.value === how);
     const gmQuip = buildGoalQuip(
       logData.goalX,
@@ -533,6 +957,7 @@ export default function App() {
   };
 
   const removeEvent = (id) => {
+    if (!canEdit) return;
     update(prev => {
       const cm = { ...prev.currentMatch };
       const ev = cm.events.find(e => e.id === id);
@@ -548,152 +973,290 @@ export default function App() {
   // ── Views ──────────────────────────────────────────────────────────────────
 
   // DASHBOARD
-  const Dashboard = () => (
-    <>
-      <div className="topbar">
-        <div className="topbar-logo">Wednesday FC ⚽</div>
-        <div className="topbar-week">
-          {season.matches.length > 0 ? `Week ${season.matches.length}` : "Season start"}
-        </div>
-      </div>
+  const Dashboard = () => {
+    const miniStats = useMemo(() => {
+      let goals = 0;
+      let ogs = 0;
+      season.matches.forEach((m) => {
+        (m.events || []).forEach((ev) => {
+          if (ev.type === "goal") {
+            if (ev.isOG || ev.how === "own_goal") ogs += 1;
+            else goals += 1;
+          }
+        });
+      });
+      return { goals, ogs, weeks: season.matches.length };
+    }, [season.matches]);
 
-      {!lastMatch ? (
-        <div className="card">
-          <div className="no-matches">
-            <div style={{ fontSize: 40, marginBottom: 12 }}>⚽</div>
-            <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 6, color: "#333" }}>No matches yet</div>
-            <div>Get the lads together and log your first game.</div>
-          </div>
-          <button className="btn btn-primary" onClick={startNewMatch}>Log first match</button>
-        </div>
-      ) : (
-        <>
-          {/* Last match */}
-          <div className="card match-card">
-            <div className="section-label">Last result — {fmtDate(lastMatch.date)}</div>
-            <div className="score-row">
-              <div className="score-team">
-                <div className="score-team-name">{lastMatch.team1.name}</div>
-                <div className="score-num">{lastMatch.score1}</div>
-              </div>
-              <div className="score-vs">—</div>
-              <div className="score-team">
-                <div className="score-team-name">{lastMatch.team2.name}</div>
-                <div className="score-num">{lastMatch.score2}</div>
-              </div>
-            </div>
-            <div style={{ textAlign: "center" }}>
-              {lastMatch.score1 === lastMatch.score2
-                ? <span className="draw-badge">Draw — honourable</span>
-                : <span className="winner-badge">
-                    {lastMatch.score1 > lastMatch.score2 ? lastMatch.team1.name : lastMatch.team2.name} win
-                  </span>}
-            </div>
-            <div className="match-footer">
-              <span>{fmtDate(lastMatch.date)}</span>
-              <span>
-                {[...(lastMatch.team1.players || []), ...(lastMatch.team2.players || [])].length} lads
-              </span>
-            </div>
-          </div>
+    const feedName =
+      latestAchNotif?.players?.name ||
+      latestAchNotif?.players?.[0]?.name ||
+      null;
+    const feedType = latestAchNotif?.type;
+    const feedShort =
+      feedType && ACHIEVEMENT_META[feedType]
+        ? ACHIEVEMENT_META[feedType].label.split(" — ")[0].trim()
+        : feedType;
 
-          {/* Goal feed */}
-          {lastMatch.events?.length > 0 && (
-            <div className="card card-sm">
-              <div className="section-label">
-                How it happened <span className="pill">{lastMatch.events.length} goals</span>
-              </div>
-              {lastMatch.events.map((ev, i) => (
-                <div className="goal-item" key={ev.id}>
-                  <div className="goal-icon">{ev.isOG ? "😬" : "⚽"}</div>
-                  <div style={{ flex: 1 }}>
-                    <div className="goal-name">
-                      {ev.player || (ev.isOG ? "Someone (OG)" : "Unknown")}
-                      {ev.isOG && <span style={{ color: "#e24b4a", fontWeight: 700 }}> (OG)</span>}
-                    </div>
-                    <div className="goal-desc">{ev.quip}{ev.gmQuip ? ` ${ev.gmQuip}` : ""}</div>
+    return (
+      <>
+        <div className="topbar">
+          <div className="topbar-logo">Wednesday FC ⚽</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div className="topbar-week">
+              {isAdminUser ? "Admin" : isPlayerUser ? "Player" : isGuest ? "Guest" : "…"}
+            </div>
+            <div className="topbar-week" style={{ opacity: 0.85 }}>
+              {season.matches.length > 0 ? `Week ${season.matches.length}` : "Season start"}
+            </div>
+            {isGuest && (
+              <button
+                type="button"
+                className="topbar-link"
+                onClick={() => openAuthModal("Sign in to Wednesday FC", null)}
+              >
+                Sign in
+              </button>
+            )}
+            {session?.user && !myPlayer && (
+              <button
+                type="button"
+                className="topbar-link"
+                onClick={() => update(() => ({ view: "account" }))}
+              >
+                Account
+              </button>
+            )}
+            {myPlayer && (
+              <button
+                type="button"
+                className="avatar-btn"
+                title="Your profile — right-click to log out"
+                aria-label="Open your profile"
+                onClick={() => update(() => ({ view: "profile" }))}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  if (window.confirm("Log out?")) handleLogout();
+                }}
+              >
+                {initials(myPlayer.name)}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {isPlayerUser && (
+          <div className="card card-sm" style={{ marginBottom: 10, background: "#fafafa" }}>
+            <div style={{ fontSize: 13, color: "#555" }}>View only — squad admins log matches and edit the squad.</div>
+          </div>
+        )}
+
+        {latestAchNotif && feedName && feedShort && (
+          <div className="ach-feed-card">
+            <div className="ach-feed-emoji">🏆</div>
+            <div className="ach-feed-text">
+              <strong>{feedName}</strong> just earned <strong>{feedShort}</strong>
+            </div>
+          </div>
+        )}
+
+        {!lastMatch ? (
+          <div className="card">
+            <div className="no-matches">
+              <div style={{ fontSize: 40, marginBottom: 12 }}>⚽</div>
+              <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 6, color: "#333" }}>No matches yet</div>
+              <div>Get the lads together and log your first game.</div>
+            </div>
+            <button type="button" className="btn btn-primary" onClick={requestLogMatch}>
+              Log first match
+            </button>
+            {!isAdminUser && (
+              <p className="auth-hint" style={{ marginTop: 10 }}>
+                {isGuest
+                  ? "Sign in with an admin account to log matches — or browse as a guest."
+                  : "Match logging is for squad admins only — you can still follow along here."}
+              </p>
+            )}
+          </div>
+        ) : (
+          <div className="dashboard-grid">
+            <div className="main-col">
+              <div className="card match-card">
+                <div className="section-label">Last result — {fmtDate(lastMatch.date)}</div>
+                <div className="score-row">
+                  <div className="score-team">
+                    <div className="score-team-name">{lastMatch.team1.name}</div>
+                    <div className="score-num">{lastMatch.score1}</div>
                   </div>
-                  <div className="goal-time">Goal {i + 1}</div>
+                  <div className="score-vs">—</div>
+                  <div className="score-team">
+                    <div className="score-team-name">{lastMatch.team2.name}</div>
+                    <div className="score-num">{lastMatch.score2}</div>
+                  </div>
                 </div>
-              ))}
-            </div>
-          )}
-
-          {/* MOTM */}
-          {lastMatch.motm && (
-            <div className="card card-sm">
-              <div className="section-label">Man of the match</div>
-              <div className="motm-card">
-                <div className={`avatar avatar-lg avatar-amber`}>{initials(lastMatch.motm)}</div>
-                <div>
-                  <div className="motm-name">{lastMatch.motm}</div>
-                  <div className="motm-sub">The lads voted. Can't argue with it.</div>
+                <div style={{ textAlign: "center" }}>
+                  {lastMatch.score1 === lastMatch.score2
+                    ? <span className="draw-badge">Draw — honourable</span>
+                    : <span className="winner-badge">
+                        {lastMatch.score1 > lastMatch.score2 ? lastMatch.team1.name : lastMatch.team2.name} win
+                      </span>}
+                </div>
+                <div className="match-footer">
+                  <span>{fmtDate(lastMatch.date)}</span>
+                  <span>
+                    {[...(lastMatch.team1.players || []), ...(lastMatch.team2.players || [])].length} lads
+                  </span>
                 </div>
               </div>
-            </div>
-          )}
 
-          {/* Stats */}
-          {allGoals.length > 0 && (
-            <div className="stats-2col">
-              <div className="card card-sm">
-                <div className="section-label">Top scorer</div>
-                {allGoals.slice(0, 3).map(([name, n], i) => (
-                  <div className="stat-row" key={name}>
-                    <div className="avatar">{initials(name)}</div>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div className="stat-name">{name}</div>
-                      <div className="bar-wrap">
-                        <div className="bar" style={{ width: `${(n / allGoals[0][1]) * 100}%` }} />
+              {lastMatch.events?.length > 0 && (
+                <div className="card card-sm">
+                  <div className="section-label">
+                    How it happened <span className="pill">{lastMatch.events.length} goals</span>
+                  </div>
+                  {lastMatch.events.map((ev, i) => (
+                    <div className="goal-item" key={ev.id}>
+                      <div className="goal-icon">{ev.isOG ? "😬" : "⚽"}</div>
+                      <div style={{ flex: 1 }}>
+                        <div className="goal-name">
+                          {ev.player || (ev.isOG ? "Someone (OG)" : "Unknown")}
+                          {ev.isOG && <span style={{ color: "#e24b4a", fontWeight: 700 }}> (OG)</span>}
+                        </div>
+                        <div className="goal-desc">{ev.quip}{ev.gmQuip ? ` ${ev.gmQuip}` : ""}</div>
                       </div>
+                      <div className="goal-time">Goal {i + 1}</div>
                     </div>
-                    <div className="stat-val">{n}</div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="sidebar">
+              {lastMatch.motm && (
+                <div className="card card-sm">
+                  <div className="section-label">Man of the match</div>
+                  <div className="motm-card">
+                    <div className="avatar avatar-lg avatar-amber">{initials(lastMatch.motm)}</div>
+                    <div>
+                      <div className="motm-name">{lastMatch.motm}</div>
+                      <div className="motm-sub">The lads voted. Can't argue with it.</div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div className="dashboard-mini-stats">
+                <div className="card card-sm dashboard-mini-stat">
+                  <div className="dashboard-mini-stat-val">{miniStats.goals}</div>
+                  <div className="dashboard-mini-stat-lbl">Goals this season</div>
+                </div>
+                <div className="card card-sm dashboard-mini-stat">
+                  <div className="dashboard-mini-stat-val">{miniStats.weeks}</div>
+                  <div className="dashboard-mini-stat-lbl">Weeks played</div>
+                </div>
+                <div className="card card-sm dashboard-mini-stat">
+                  <div className="dashboard-mini-stat-val">{miniStats.ogs}</div>
+                  <div className="dashboard-mini-stat-lbl">Own goals 🥚</div>
+                </div>
+              </div>
+
+              {allGoals.length > 0 && (
+                <div className="card card-sm">
+                  <div className="section-label">Top scorer</div>
+                  {allGoals.slice(0, 3).map(([name, n]) => (
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      className={`stat-row stat-row--click${myPlayer?.name === name ? " stat-row--me" : ""}`}
+                      key={name}
+                      onClick={() => update(() => ({ view: "player_profile", playerProfileName: name }))}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          update(() => ({ view: "player_profile", playerProfileName: name }));
+                        }
+                      }}
+                    >
+                      <div className="avatar">{initials(name)}</div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div className="stat-name">{name}</div>
+                        <div className="bar-wrap">
+                          <div className="bar" style={{ width: `${(n / allGoals[0][1]) * 100}%` }} />
+                        </div>
+                      </div>
+                      <div className="stat-val">{n}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {allGoals.length > 0 && (
+                <div className="card card-sm">
+                  <div className="section-label">Hall of shame</div>
+                  {allOGs.length > 0 ? allOGs.slice(0, 3).map(([name, n]) => (
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      className={`stat-row stat-row--click${myPlayer?.name === name ? " stat-row--me" : ""}`}
+                      key={name}
+                      onClick={() => update(() => ({ view: "player_profile", playerProfileName: name }))}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          update(() => ({ view: "player_profile", playerProfileName: name }));
+                        }
+                      }}
+                    >
+                      <div className="avatar avatar-og">{initials(name)}</div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div className="stat-name">{name}</div>
+                        <div className="bar-wrap">
+                          <div className="bar bar-og" style={{ width: `${(n / allOGs[0][1]) * 100}%` }} />
+                        </div>
+                      </div>
+                      <div className="stat-val">{n}</div>
+                    </div>
+                  )) : (
+                    <div className="empty-state">No OGs yet.<br/>The season is young.</div>
+                  )}
+                  {allOGs.length > 0 && <div style={{ fontSize: 11, color: "#bbb", marginTop: 8 }}>Own goals only. You know who you are.</div>}
+                </div>
+              )}
+
+              <div className="card card-sm">
+                <div className="section-label">Season so far</div>
+                {banter.map((line, i) => (
+                  <div className="banter-item" key={i}>
+                    <div className="banter-icon">{line.slice(0, 2)}</div>
+                    <div>{line.slice(2).trim()}</div>
                   </div>
                 ))}
               </div>
-
-              <div className="card card-sm">
-                <div className="section-label">Hall of shame</div>
-                {allOGs.length > 0 ? allOGs.slice(0, 3).map(([name, n]) => (
-                  <div className="stat-row" key={name}>
-                    <div className="avatar avatar-og">{initials(name)}</div>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div className="stat-name">{name}</div>
-                      <div className="bar-wrap">
-                        <div className="bar bar-og" style={{ width: `${(n / allOGs[0][1]) * 100}%` }} />
-                      </div>
-                    </div>
-                    <div className="stat-val">{n}</div>
-                  </div>
-                )) : (
-                  <div className="empty-state">No OGs yet.<br/>The season is young.</div>
-                )}
-                {allOGs.length > 0 && <div style={{ fontSize: 11, color: "#bbb", marginTop: 8 }}>Own goals only. You know who you are.</div>}
-              </div>
             </div>
-          )}
-
-          {/* Banter */}
-          <div className="card card-sm">
-            <div className="section-label">Season so far</div>
-            {banter.map((line, i) => (
-              <div className="banter-item" key={i}>
-                <div className="banter-icon">{line.slice(0, 2)}</div>
-                <div>{line.slice(2).trim()}</div>
-              </div>
-            ))}
           </div>
-        </>
-      )}
+        )}
 
-      <button className="btn btn-primary" onClick={startNewMatch}>
-        + Log this week's match
-      </button>
-    </>
-  );
+        <button type="button" className="btn btn-primary" onClick={requestLogMatch}>
+          + Log this week&apos;s match
+        </button>
+      </>
+    );
+  };
 
   // NEW MATCH SETUP
   const NewMatch = () => {
+    if (!canEdit) {
+      return (
+        <>
+          <button type="button" className="back-btn" onClick={() => update(() => ({ view: "dashboard", currentMatch: null }))}>
+            ← Back
+          </button>
+          <div className="card card-sm">
+            <p style={{ fontSize: 14, color: "#555" }}>Only admins can set up or log matches.</p>
+          </div>
+        </>
+      );
+    }
     const [lineup, setLineup] = useState(() => ({
       team1: currentMatch?.team1 || { name: "Bibs", color: "#f59e0b", players: [] },
       team2: currentMatch?.team2 || { name: "Skins", color: "#3b82f6", players: [] },
@@ -889,24 +1452,69 @@ export default function App() {
         </div>
         <div className="card card-sm">
           <div className="section-label">Add player</div>
-          <div style={{ display: "flex", gap: 8 }}>
-            <input
-              className="form-input"
-              style={{ flex: 1 }}
-              placeholder="Name..."
-              value={addInp}
-              onChange={(e) => setAddInp(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  addSquadPlayer(addInp);
-                  setAddInp("");
-                }
-              }}
-            />
-            <button type="button" className="btn btn-primary btn-sm" style={{ width: "auto" }} onClick={() => { addSquadPlayer(addInp); setAddInp(""); }}>
-              Add
-            </button>
-          </div>
+          {isAdminUser ? (
+            <div style={{ display: "flex", gap: 8 }}>
+              <input
+                className="form-input"
+                style={{ flex: 1 }}
+                placeholder="Name..."
+                value={addInp}
+                onChange={(e) => setAddInp(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    addSquadPlayer(addInp);
+                    setAddInp("");
+                  }
+                }}
+              />
+              <button type="button" className="btn btn-primary btn-sm" style={{ width: "auto" }} onClick={() => { addSquadPlayer(addInp); setAddInp(""); }}>
+                Add
+              </button>
+            </div>
+          ) : isGuest ? (
+            <div style={{ display: "flex", gap: 8 }}>
+              <input
+                className="form-input"
+                style={{ flex: 1 }}
+                placeholder="Name..."
+                value={addInp}
+                onChange={(e) => setAddInp(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    const nm = addInp.trim();
+                    if (!nm) return;
+                    requestSquadAdmin(
+                      () => {
+                        addSquadPlayer(addInp);
+                        setAddInp("");
+                      },
+                      { kind: "squad_add", meta: { name: nm } }
+                    );
+                  }
+                }}
+              />
+              <button
+                type="button"
+                className="btn btn-primary btn-sm"
+                style={{ width: "auto" }}
+                onClick={() => {
+                  const nm = addInp.trim();
+                  if (!nm) return;
+                  requestSquadAdmin(
+                    () => {
+                      addSquadPlayer(addInp);
+                      setAddInp("");
+                    },
+                    { kind: "squad_add", meta: { name: nm } }
+                  );
+                }}
+              >
+                Add
+              </button>
+            </div>
+          ) : (
+            <p style={{ fontSize: 13, color: "#888" }}>Only admins can change the squad.</p>
+          )}
         </div>
         <div className="card card-sm">
           <div className="section-label">Saved players</div>
@@ -917,9 +1525,25 @@ export default function App() {
               {season.players.map((name) => (
                 <div className="player-tag" key={name}>
                   <span>{name}</span>
-                  <button type="button" onClick={() => removeSquadPlayer(name)} aria-label={`Remove ${name}`}>
-                    ×
-                  </button>
+                  {isAdminUser && (
+                    <button type="button" onClick={() => removeSquadPlayer(name)} aria-label={`Remove ${name}`}>
+                      ×
+                    </button>
+                  )}
+                  {isGuest && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        requestSquadAdmin(() => removeSquadPlayer(name), {
+                          kind: "squad_remove",
+                          meta: { name },
+                        })
+                      }
+                      aria-label={`Remove ${name}`}
+                    >
+                      ×
+                    </button>
+                  )}
                 </div>
               ))}
             </div>
@@ -934,18 +1558,29 @@ export default function App() {
     const cm = currentMatch;
     if (!cm) return null;
 
-    const setMOTM = (name) => update(prev => ({
-      currentMatch: { ...prev.currentMatch, motm: name }
-    }));
+    const setMOTM = (name) => {
+      if (!canEdit) return;
+      update((prev) => ({
+        currentMatch: { ...prev.currentMatch, motm: name },
+      }));
+    };
 
     const allMatchPlayers = [...(cm.team1.players || []), ...(cm.team2.players || [])];
 
     return (
       <>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-          <button className="back-btn" onClick={() => update(() => ({ view: "new_match" }))}>← Setup</button>
+          <button className="back-btn" onClick={() => update(() => ({ view: canEdit ? "new_match" : "dashboard", currentMatch: canEdit ? cm : null }))}>
+            ← {canEdit ? "Setup" : "Back"}
+          </button>
           <span style={{ fontSize: 12, color: "#999", fontWeight: 600 }}>Live</span>
         </div>
+
+        {!canEdit && (
+          <div className="card card-sm" style={{ marginBottom: 10, background: "#fafafa" }}>
+            <div style={{ fontSize: 12, color: "#666" }}>View only — admins log goals and save matches.</div>
+          </div>
+        )}
 
         {/* Live score */}
         <div className="card">
@@ -953,47 +1588,56 @@ export default function App() {
             <div className="score-team">
               <div className="score-team-name">{cm.team1.name}</div>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <button className="score-adj-btn" onClick={() => update(prev => {
-                  const cm2 = { ...prev.currentMatch };
-                  cm2.score1 = Math.max(0, cm2.score1 - 1);
-                  return { currentMatch: cm2 };
-                })}>−</button>
+                {canEdit && (
+                  <button type="button" className="score-adj-btn" onClick={() => update((prev) => {
+                    const cm2 = { ...prev.currentMatch };
+                    cm2.score1 = Math.max(0, cm2.score1 - 1);
+                    return { currentMatch: cm2 };
+                  })}>−</button>
+                )}
                 <div className="live-score">{cm.score1}</div>
-                <button className="score-adj-btn" onClick={() => update(prev => {
-                  const cm2 = { ...prev.currentMatch };
-                  cm2.score1 = cm2.score1 + 1;
-                  return { currentMatch: cm2 };
-                })}>+</button>
+                {canEdit && (
+                  <button type="button" className="score-adj-btn" onClick={() => update((prev) => {
+                    const cm2 = { ...prev.currentMatch };
+                    cm2.score1 = cm2.score1 + 1;
+                    return { currentMatch: cm2 };
+                  })}>+</button>
+                )}
               </div>
             </div>
             <div className="score-vs">—</div>
             <div className="score-team">
               <div className="score-team-name">{cm.team2.name}</div>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <button className="score-adj-btn" onClick={() => update(prev => {
-                  const cm2 = { ...prev.currentMatch };
-                  cm2.score2 = Math.max(0, cm2.score2 - 1);
-                  return { currentMatch: cm2 };
-                })}>−</button>
+                {canEdit && (
+                  <button type="button" className="score-adj-btn" onClick={() => update((prev) => {
+                    const cm2 = { ...prev.currentMatch };
+                    cm2.score2 = Math.max(0, cm2.score2 - 1);
+                    return { currentMatch: cm2 };
+                  })}>−</button>
+                )}
                 <div className="live-score">{cm.score2}</div>
-                <button className="score-adj-btn" onClick={() => update(prev => {
-                  const cm2 = { ...prev.currentMatch };
-                  cm2.score2 = cm2.score2 + 1;
-                  return { currentMatch: cm2 };
-                })}>+</button>
+                {canEdit && (
+                  <button type="button" className="score-adj-btn" onClick={() => update((prev) => {
+                    const cm2 = { ...prev.currentMatch };
+                    cm2.score2 = cm2.score2 + 1;
+                    return { currentMatch: cm2 };
+                  })}>+</button>
+                )}
               </div>
             </div>
           </div>
 
-          {/* Team selector for goal log */}
+          {canEdit && (
           <div style={{ marginBottom: 10 }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: "#999", textTransform: "uppercase", letterSpacing: "0.8px", marginBottom: 8 }}>
               Log a goal for...
             </div>
             <div style={{ display: "flex", gap: 8 }}>
-              {[1,2].map(t => (
+              {[1, 2].map((t) => (
                 <button
                   key={t}
+                  type="button"
                   className="btn btn-ghost"
                   style={{ flex: 1, background: logData.team === t ? "#111" : undefined, color: logData.team === t ? "#fff" : undefined }}
                   onClick={() => {
@@ -1005,10 +1649,11 @@ export default function App() {
               ))}
             </div>
           </div>
+          )}
         </div>
 
         {/* Player select step */}
-        {logStep === "player" && (
+        {canEdit && logStep === "player" && (
           <div className="card card-sm">
             <div className="section-label">Who scored?</div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
@@ -1035,7 +1680,7 @@ export default function App() {
         )}
 
         {/* Pitch tap step */}
-        {logStep === "pitch" && (
+        {canEdit && logStep === "pitch" && (
           <div className="card card-sm">
             <div className="section-label">Where on the pitch?</div>
             <PitchSVG events={cm.events} onTap={handlePitchClick} />
@@ -1044,7 +1689,7 @@ export default function App() {
         )}
 
         {/* Goalmouth step */}
-        {logStep === "goalmouth" && (
+        {canEdit && logStep === "goalmouth" && (
           <div className="card card-sm">
             <div className="section-label">Where did it go in?</div>
             <GoalmouthSVG
@@ -1060,7 +1705,7 @@ export default function App() {
         )}
 
         {/* How scored step */}
-        {logStep === "how" && (
+        {canEdit && logStep === "how" && (
           <div className="card card-sm">
             <div className="section-label">How was it scored?</div>
             <div className="how-grid">
@@ -1087,7 +1732,7 @@ export default function App() {
                   </div>
                   <div className="goal-desc">{ev.quip}</div>
                 </div>
-                <button className="goal-del" onClick={() => removeEvent(ev.id)}>×</button>
+                {canEdit && <button type="button" className="goal-del" onClick={() => removeEvent(ev.id)}>×</button>}
               </div>
             ))}
           </div>
@@ -1097,26 +1742,42 @@ export default function App() {
         {allMatchPlayers.length > 0 && (
           <div className="card card-sm">
             <div className="section-label">Man of the match</div>
-            <div className="motm-select">
-              {allMatchPlayers.map(p => (
-                <button
-                  key={p}
-                  className={`motm-option ${cm.motm === p ? "selected" : ""}`}
-                  onClick={() => setMOTM(p)}
-                >
-                  <div className="avatar" style={{ width: 24, height: 24, fontSize: 9, flexShrink: 0 }}>{initials(p)}</div>
-                  {p}
-                </button>
-              ))}
-            </div>
+            {canEdit ? (
+              <div className="motm-select">
+                {allMatchPlayers.map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    className={`motm-option ${cm.motm === p ? "selected" : ""}`}
+                    onClick={() => setMOTM(p)}
+                  >
+                    <div className="avatar" style={{ width: 24, height: 24, fontSize: 9, flexShrink: 0 }}>{initials(p)}</div>
+                    {p}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="motm-card">
+                {cm.motm ? (
+                  <>
+                    <div className="avatar avatar-lg avatar-amber">{initials(cm.motm)}</div>
+                    <div><div className="motm-name">{cm.motm}</div></div>
+                  </>
+                ) : (
+                  <div style={{ fontSize: 13, color: "#999" }}>Not picked yet</div>
+                )}
+              </div>
+            )}
           </div>
         )}
 
-        <button className="btn btn-green" onClick={saveCurrentMatch}>
-          ✓ Save match
-        </button>
-        <button className="btn btn-ghost" onClick={() => update(() => ({ view: "dashboard", currentMatch: null }))}>
-          Discard
+        {canEdit && (
+          <button type="button" className="btn btn-green" onClick={saveCurrentMatch}>
+            ✓ Save match
+          </button>
+        )}
+        <button type="button" className="btn btn-ghost" onClick={() => update(() => ({ view: "dashboard", currentMatch: null }))}>
+          {canEdit ? "Discard" : "Close"}
         </button>
       </>
     );
@@ -1149,19 +1810,218 @@ export default function App() {
           })}
         </div>
       )}
-      <button className="btn btn-danger btn-sm" onClick={() => {
-        if (window.confirm("Reset entire season? This cannot be undone.")) {
-          const empty = { matches: [], players: [] };
-          upsertSeasonToSupabase(empty).catch((e) => {
-            console.warn("Supabase save failed; data kept in local storage", e);
-          });
-          update(() => ({ season: empty }));
-        }
-      }}>
-        Reset season
-      </button>
+      {(isAdminUser || isGuest) && (
+        <button type="button" className="btn btn-danger btn-sm" onClick={requestResetSeason}>
+          Reset season
+        </button>
+      )}
     </>
   );
+
+  const Account = () => (
+    <>
+      <button type="button" className="back-btn" onClick={() => update(() => ({ view: "dashboard" }))}>
+        ← Back
+      </button>
+      <div className="topbar">
+        <div className="topbar-logo">Account</div>
+        <div className="topbar-week">Signed in</div>
+      </div>
+      <div className="card card-sm">
+        <p style={{ fontSize: 14, color: "#555", marginBottom: 14, lineHeight: 1.5 }}>
+          Link your account to a squad name to unlock personal stats and achievements.
+        </p>
+        <button type="button" className="btn btn-primary" onClick={requestClaimProfile}>
+          Claim your profile
+        </button>
+      </div>
+      <p style={{ textAlign: "center", marginTop: 16 }}>
+        <button type="button" className="btn btn-ghost btn-sm" onClick={handleLogout}>
+          Log out
+        </button>
+      </p>
+    </>
+  );
+
+  const PlayerProfileView = () => {
+    const name = playerProfileName || "";
+    const [row, setRow] = useState(null);
+    const [pAch, setPAch] = useState([]);
+    const stats = useMemo(() => playerSeasonStats(season, name), [season, name]);
+
+    useEffect(() => {
+      let cancelled = false;
+      (async () => {
+        if (!name || !supabase) {
+          setRow(null);
+          setPAch([]);
+          return;
+        }
+        const p = await fetchPlayerByName(supabase, name);
+        if (cancelled) return;
+        setRow(p);
+        if (p?.id) {
+          const a = await fetchAchievementsForPlayer(supabase, p.id);
+          if (!cancelled) setPAch(a);
+        } else {
+          setPAch([]);
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }, [name]);
+
+    const isMe = myPlayer && row && myPlayer.id === row.id;
+    const showClaimCta = Boolean(row && row.claimed_by == null && !myPlayer);
+
+    const claimThisPlayer = () => {
+      if (!row?.id) return;
+      if (!session?.user) {
+        openAuthModal("Claim your profile", { kind: "claim_player", meta: { playerId: row.id } });
+        return;
+      }
+      if (myPlayer) {
+        showToast("You're already linked to a profile.");
+        return;
+      }
+      (async () => {
+        try {
+          await claimPlayerRow(supabase, row.id);
+          await refreshMyPlayer();
+          update(() => ({ view: "profile", playerProfileName: null }));
+        } catch (e) {
+          showToast(e?.message || "Could not claim profile");
+        }
+      })();
+    };
+
+    return (
+      <>
+        <button
+          type="button"
+          className="back-btn"
+          onClick={() => update(() => ({ view: "dashboard", playerProfileName: null }))}
+        >
+          ← Back
+        </button>
+        <div className="topbar">
+          <div className="topbar-logo">{name || "Player"}</div>
+          <div className="topbar-week">Profile</div>
+        </div>
+        <div className="card card-sm">
+          <div className="section-label">Season stats</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, textAlign: "center" }}>
+            <div>
+              <div style={{ fontSize: 22, fontWeight: 900 }}>{stats.goals}</div>
+              <div style={{ fontSize: 11, color: "#888" }}>Goals</div>
+            </div>
+            <div>
+              <div style={{ fontSize: 22, fontWeight: 900 }}>{stats.ogs}</div>
+              <div style={{ fontSize: 11, color: "#888" }}>Own goals</div>
+            </div>
+            <div>
+              <div style={{ fontSize: 22, fontWeight: 900 }}>{stats.apps}</div>
+              <div style={{ fontSize: 11, color: "#888" }}>Appearances</div>
+            </div>
+          </div>
+        </div>
+        <div className="card">
+          <div className="section-label">Achievements</div>
+          {pAch.length === 0 ? (
+            <p style={{ fontSize: 14, color: "#999" }}>None yet.</p>
+          ) : (
+            <div className="profile-badges" role="list">
+              {pAch.map((ar) => {
+                const meta = ACHIEVEMENT_META[ar.type];
+                return (
+                  <span
+                    key={ar.id}
+                    className="ach-badge"
+                    role="listitem"
+                    title={meta?.label || ar.type}
+                    aria-label={meta?.label || ar.type}
+                  >
+                    {meta?.emoji || "🏅"}
+                  </span>
+                );
+              })}
+            </div>
+          )}
+        </div>
+        {isMe && (
+          <p style={{ fontSize: 13, color: "#666", textAlign: "center" }}>This is you — full details in Profile.</p>
+        )}
+        {showClaimCta && (
+          <button type="button" className="btn btn-primary" onClick={claimThisPlayer}>
+            Claim this profile
+          </button>
+        )}
+        {row?.claimed_by != null && !isMe && (
+          <p style={{ fontSize: 13, color: "#888", textAlign: "center" }}>This name is already claimed.</p>
+        )}
+      </>
+    );
+  };
+
+  const Profile = () => {
+    if (!myPlayer) {
+      return (
+        <>
+          <button type="button" className="back-btn" onClick={() => update(() => ({ view: "dashboard" }))}>
+            ← Back
+          </button>
+          <div className="card card-sm">
+            <p style={{ fontSize: 14, color: "#555" }}>Claim a squad profile to see your page here.</p>
+            <button type="button" className="btn btn-primary" style={{ marginTop: 10 }} onClick={requestClaimProfile}>
+              Claim your profile
+            </button>
+          </div>
+        </>
+      );
+    }
+    return (
+      <>
+        <button type="button" className="back-btn" onClick={() => update(() => ({ view: "dashboard" }))}>
+          ← Back
+        </button>
+        <div className="topbar">
+          <div className="topbar-logo">Profile</div>
+          <div className="topbar-week">{myPlayer?.is_admin ? "Admin" : "Player"}</div>
+        </div>
+        <div className="card">
+          <div className="section-label">Name</div>
+          <div style={{ fontSize: 22, fontWeight: 900 }}>{myPlayer?.name}</div>
+          <div className="section-label" style={{ marginTop: 20 }}>Achievements</div>
+          {profileAch.length === 0 ? (
+            <p style={{ fontSize: 14, color: "#999" }}>None yet — keep turning up on Wednesdays.</p>
+          ) : (
+            <div className="profile-badges" role="list">
+              {profileAch.map((achRow) => {
+                const meta = ACHIEVEMENT_META[achRow.type];
+                return (
+                  <span
+                    key={achRow.id}
+                    className="ach-badge"
+                    role="listitem"
+                    title={meta?.label || achRow.type}
+                    aria-label={meta?.label || achRow.type}
+                  >
+                    {meta?.emoji || "🏅"}
+                  </span>
+                );
+              })}
+            </div>
+          )}
+        </div>
+        <p style={{ textAlign: "center", marginTop: 16 }}>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={handleLogout}>
+            Log out
+          </button>
+        </p>
+      </>
+    );
+  };
 
   // PITCH SVG component
   const PitchSVG = ({ events = [], onTap }) => (
@@ -1205,32 +2065,310 @@ export default function App() {
     </svg>
   );
 
+  /** After magic-link redirect, resume the action the user started before sign-in. */
+  useEffect(() => {
+    if (!supabase || !session?.user) return;
+    const pending = readAndClearPendingAuth();
+    if (!pending?.kind) return;
+
+    queueMicrotask(async () => {
+      const row = await fetchMyPlayer(supabase);
+      setMyPlayer(row ?? null);
+
+      const toast = (msg) => {
+        setToastMsg(msg);
+        window.setTimeout(() => setToastMsg(""), 2800);
+      };
+
+      switch (pending.kind) {
+        case "claim":
+          openClaimSheetFromState();
+          break;
+        case "claim_player": {
+          const pid = pending.meta?.playerId;
+          if (!pid) break;
+          try {
+            await claimPlayerRow(supabase, pid);
+            await refreshMyPlayer();
+            update(() => ({ view: "profile", playerProfileName: null }));
+          } catch (e) {
+            toast(e?.message || "Could not claim profile");
+          }
+          break;
+        }
+        case "log_match":
+          if (row?.is_admin) queueMicrotask(() => beginNewMatch());
+          else toast("Only admins can log matches");
+          break;
+        case "reset_season":
+          if (!row?.is_admin) {
+            toast("Only admins can reset the season");
+            break;
+          }
+          queueMicrotask(() => {
+            if (!window.confirm("Reset entire season? This cannot be undone.")) return;
+            const empty = { matches: [], players: [] };
+            upsertSeasonToSupabase(empty).catch((e) => {
+              console.warn("Supabase save failed; data kept in local storage", e);
+            });
+            update(() => ({ season: empty }));
+          });
+          break;
+        case "squad_add": {
+          const nm = (pending.meta?.name || "").trim();
+          if (!row?.is_admin) {
+            toast("Only admins can change the squad");
+            break;
+          }
+          if (!nm) break;
+          queueMicrotask(() => {
+            setState((prev) => {
+              if (prev.season.players.includes(nm)) return prev;
+              const nextSeason = { ...prev.season, players: [...prev.season.players, nm] };
+              upsertSeasonToSupabase(nextSeason).catch((err) => {
+                console.warn("Supabase save failed; squad kept in local storage", err);
+              });
+              return { ...prev, season: nextSeason };
+            });
+          });
+          break;
+        }
+        case "squad_remove": {
+          const nm = pending.meta?.name;
+          if (!row?.is_admin) {
+            toast("Only admins can change the squad");
+            break;
+          }
+          if (!nm) break;
+          queueMicrotask(() => {
+            setState((prev) => {
+              const nextSeason = { ...prev.season, players: prev.season.players.filter((p) => p !== nm) };
+              upsertSeasonToSupabase(nextSeason).catch((err) => {
+                console.warn("Supabase save failed; squad kept in local storage", err);
+              });
+              return { ...prev, season: nextSeason };
+            });
+          });
+          break;
+        }
+        default:
+          break;
+      }
+    });
+    // Intentionally only when the signed-in user changes (post magic-link redirect).
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- resume uses latest handlers from this render
+  }, [session?.user?.id]);
+
   // ── Render ────────────────────────────────────────────────────────────────
+  if (!supabase) {
+    return (
+      <>
+        <style>{CSS}</style>
+        <div className="app auth-screen">
+          <div className="auth-title">Wednesday FC</div>
+          <div className="auth-card">
+            <p style={{ fontSize: 14, color: "#555", lineHeight: 1.6 }}>
+              Set <code style={{ fontSize: 13 }}>VITE_SUPABASE_URL</code> and{" "}
+              <code style={{ fontSize: 13 }}>VITE_SUPABASE_ANON_KEY</code> in{" "}
+              <code style={{ fontSize: 13 }}>.env</code>, then restart the dev server.
+            </p>
+          </div>
+        </div>
+      </>
+    );
+  }
+
   return (
     <>
       <style>{CSS}</style>
+      {toastMsg ? <div className="toast-mini">{toastMsg}</div> : null}
       <div className="app">
         {view === "dashboard" && <Dashboard />}
         {view === "new_match" && <NewMatch />}
         {view === "live" && <LiveMatch />}
         {view === "squad" && <Squad />}
         {view === "history" && <History />}
+        {view === "profile" && <Profile />}
+        {view === "account" && <Account />}
+        {view === "player_profile" && playerProfileName && <PlayerProfileView />}
       </div>
 
-      {/* Bottom nav */}
+      {authModal.open && (
+        <div
+          className="auth-sheet-backdrop auth-sheet-backdrop--center"
+          role="presentation"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) closeAuthModal();
+          }}
+        >
+          <div className="auth-sheet auth-sheet-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="auth-sheet-head">
+              <div>
+                <div className="auth-sheet-title">Sign in to continue</div>
+                {authModal.subtitle ? <div className="auth-sheet-sub">{authModal.subtitle}</div> : null}
+              </div>
+              <button type="button" className="auth-sheet-close" aria-label="Close" onClick={closeAuthModal}>
+                ×
+              </button>
+            </div>
+            {magicLinkStep === "email" ? (
+              <>
+                <div className="form-group">
+                  <label className="form-label" htmlFor="wnf-email-modal">
+                    Email address
+                  </label>
+                  <input
+                    id="wnf-email-modal"
+                    className="form-input"
+                    type="email"
+                    inputMode="email"
+                    autoComplete="email"
+                    value={emailInput}
+                    onChange={(e) => setEmailInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleSendMagicLink();
+                    }}
+                    placeholder="your@email.com"
+                  />
+                </div>
+                <button type="button" className="btn btn-primary" onClick={handleSendMagicLink}>
+                  Send link
+                </button>
+              </>
+            ) : (
+              <>
+                <p style={{ fontSize: 15, fontWeight: 700, color: "#111", margin: "0 0 8px", lineHeight: 1.4 }}>
+                  Check your inbox — we&apos;ve sent you a sign in link
+                </p>
+                <p style={{ fontSize: 14, color: "#555", margin: 0, lineHeight: 1.5 }}>
+                  We&apos;ve sent a link to your inbox. Click it to sign in.
+                </p>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  style={{ marginTop: 16 }}
+                  onClick={() => {
+                    setMagicLinkStep("email");
+                    setAuthErr("");
+                  }}
+                >
+                  Use a different email
+                </button>
+              </>
+            )}
+            {authErr ? <div className="auth-err">{authErr}</div> : null}
+            {magicLinkStep === "email" ? (
+              <p className="auth-hint">We&apos;ll email you a one-time link. No password.</p>
+            ) : null}
+          </div>
+        </div>
+      )}
+
+      {claimSheetOpen && session?.user && !myPlayer && (
+        <div
+          className="auth-sheet-backdrop auth-sheet-backdrop--center"
+          role="presentation"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setClaimSheetOpen(false);
+          }}
+        >
+          <div className="auth-sheet auth-sheet-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="auth-sheet-head">
+              <div>
+                <div className="auth-sheet-title">Claim your profile</div>
+                <div className="auth-sheet-sub">Tap your name if you&apos;re on the squad, or add yourself below.</div>
+              </div>
+              <button
+                type="button"
+                className="auth-sheet-close"
+                aria-label="Close"
+                onClick={() => setClaimSheetOpen(false)}
+              >
+                ×
+              </button>
+            </div>
+            {unclaimedList.length === 0 ? (
+              <p style={{ fontSize: 14, color: "#666", marginBottom: 12 }}>
+                No unclaimed squad names yet. Add yourself below, or ask an admin to add you to the squad first.
+              </p>
+            ) : (
+              <>
+                <div className="section-label">Pick your name</div>
+                <div className="claim-list">
+                  {unclaimedList.map((pr) => (
+                    <button
+                      key={pr.id}
+                      type="button"
+                      className="claim-row"
+                      disabled={claimLoading}
+                      onClick={() => handleClaimPlayer(pr.id)}
+                    >
+                      {pr.name}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+            <div className="section-label" style={{ marginTop: 20 }}>
+              Not listed?
+            </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <input
+                className="form-input"
+                style={{ flex: 1, minWidth: 160 }}
+                placeholder="Your name"
+                value={guestClaimName}
+                onChange={(e) => setGuestClaimName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleAddSelfAndClaim();
+                }}
+              />
+              <button
+                type="button"
+                className="btn btn-primary"
+                style={{ width: "auto" }}
+                disabled={claimLoading}
+                onClick={handleAddSelfAndClaim}
+              >
+                Add &amp; claim
+              </button>
+            </div>
+            {authErr ? <div className="auth-err">{authErr}</div> : null}
+          </div>
+        </div>
+      )}
+
       {!logStep && (
         <nav className="nav">
-          <button className={`nav-btn ${view === "dashboard" ? "active" : ""}`} onClick={() => update(() => ({ view: "dashboard" }))}>
+          <button
+            type="button"
+            className={`nav-btn ${view === "dashboard" ? "active" : ""}`}
+            onClick={() => update(() => ({ view: "dashboard" }))}
+          >
             <span className="nav-icon">🏠</span>Home
           </button>
-          <button className={`nav-btn ${(view === "live" || view === "new_match") ? "active" : ""}`}
-            onClick={() => currentMatch ? update(() => ({ view: "live" })) : startNewMatch()}>
+          <button
+            type="button"
+            className={`nav-btn ${view === "live" || view === "new_match" ? "active" : ""}`}
+            onClick={() => {
+              if (currentMatch) update(() => ({ view: "live" }));
+              else requestLogMatch();
+            }}
+          >
             <span className="nav-icon">⚽</span>Match
           </button>
-          <button className={`nav-btn ${view === "squad" ? "active" : ""}`} onClick={() => update(() => ({ view: "squad" }))}>
+          <button
+            type="button"
+            className={`nav-btn ${view === "squad" ? "active" : ""}`}
+            onClick={() => update(() => ({ view: "squad" }))}
+          >
             <span className="nav-icon">👤</span>Squad
           </button>
-          <button className={`nav-btn ${view === "history" ? "active" : ""}`} onClick={() => update(() => ({ view: "history" }))}>
+          <button
+            type="button"
+            className={`nav-btn ${view === "history" ? "active" : ""}`}
+            onClick={() => update(() => ({ view: "history" }))}
+          >
             <span className="nav-icon">📋</span>History
           </button>
         </nav>
