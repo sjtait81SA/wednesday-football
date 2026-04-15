@@ -60,7 +60,7 @@ export function buildInitialSeason() {
         id: matchId,
         date: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
         team1: { name: "Bibs", color: "#f59e0b", players: t1 },
-        team2: { name: "Skins", color: "#3b82f6", players: t2 },
+        team2: { name: "Non-Bibs", color: "#3b82f6", players: t2 },
         score1: 3,
         score2: 2,
         motm: "Steven",

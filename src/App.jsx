@@ -9,6 +9,7 @@ import {
   claimPlayerRow,
   insertPlayerRow,
   processAchievementsForSavedMatch,
+  deleteAchievementsForMatchIds,
   fetchAchievementsForPlayer,
   fetchLatestAchievementFeed,
   syncSquadNamesToPlayers,
@@ -56,10 +57,24 @@ const saveLocal = (s) => {
   } catch {}
 };
 
+/** Legacy default side name; rename on load so UI matches current terminology. */
+function migrateTeamName(t) {
+  if (!t || typeof t !== "object") return t;
+  const raw = typeof t.name === "string" ? t.name.trim() : "";
+  if (raw.toLowerCase() !== "skins") return t;
+  return { ...t, name: "Non-Bibs" };
+}
+
+function migrateMatchTeams(m) {
+  if (!m || typeof m !== "object") return m;
+  return { ...m, team1: migrateTeamName(m.team1), team2: migrateTeamName(m.team2) };
+}
+
 function normalizeSeason(s) {
   if (!s || typeof s !== "object") return { matches: [], players: [] };
+  const rawMatches = Array.isArray(s.matches) ? s.matches : [];
   return {
-    matches: Array.isArray(s.matches) ? s.matches : [],
+    matches: rawMatches.map(migrateMatchTeams),
     players: Array.isArray(s.players) ? s.players : [],
   };
 }
@@ -264,7 +279,7 @@ function sanitizeAppState(raw) {
     season: normalizeSeason(raw.season),
     currentMatch:
       raw.currentMatch != null && typeof raw.currentMatch === "object"
-        ? raw.currentMatch
+        ? migrateMatchTeams(raw.currentMatch)
         : null,
     view,
     playerProfileName,
@@ -435,6 +450,36 @@ body{font-family:'Figtree',sans-serif;background:#f5f5f0;min-height:100vh;color:
 .teams-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .team-label{font-size:12px;font-weight:800;margin-bottom:8px;display:flex;align-items:center;gap:6px}
 .team-dot{width:10px;height:10px;border-radius:50%}
+.setup-header-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+.setup-title{font-weight:900;font-size:22px;color:#111;letter-spacing:-0.3px;margin:0}
+.setup-counter-pill{font-size:12px;font-weight:600;color:#666;background:#ececea;border-radius:999px;padding:6px 12px;white-space:nowrap}
+.setup-team-card{background:#fff;border-radius:16px;padding:14px 14px 16px;border:1px solid #eee}
+.setup-team-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px}
+.setup-team-title{display:flex;align-items:center;gap:8px;min-width:0;flex:1}
+.setup-team-name-input{background:none;border:none;font-family:inherit;font-weight:800;font-size:15px;color:#111;outline:none;min-width:0;flex:1}
+.setup-team-count{font-size:12px;font-weight:600;color:#999;white-space:nowrap}
+.setup-team-avatars{display:flex;flex-wrap:wrap;gap:8px;min-height:40px;align-items:center}
+.setup-avatar-btn{width:36px;height:36px;border-radius:50%;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;color:#fff;padding:0;flex-shrink:0;transition:transform 0.12s,box-shadow 0.12s}
+.setup-avatar-btn:hover{transform:scale(1.06);box-shadow:0 2px 8px rgba(0,0,0,0.12)}
+.setup-avatar-btn:active{transform:scale(0.98)}
+.setup-team-empty{font-size:13px;color:#bbb;text-align:center;padding:12px 8px}
+.setup-pool-card{background:#fff;border-radius:16px;padding:16px;border:1px solid #eee;margin-top:12px}
+.setup-pool-label{font-size:11px;font-weight:700;color:#999;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:10px}
+.setup-search{width:100%;box-sizing:border-box;margin-bottom:12px}
+.setup-pool-chips{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start}
+.setup-chip-wrap{display:flex;flex-direction:column;align-items:flex-start;gap:6px}
+.setup-chip{display:inline-flex;align-items:center;gap:8px;padding:8px 12px 8px 8px;border-radius:999px;border:1px solid #e8e8e8;background:#f7f7f5;font-size:13px;font-weight:600;color:#333;cursor:pointer;font-family:inherit;transition:background 0.15s,border-color 0.15s}
+.setup-chip:hover{background:#efefec;border-color:#ddd}
+.setup-chip-av{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:800;color:#fff;flex-shrink:0}
+.setup-picker{display:flex;gap:8px;flex-wrap:wrap;padding-left:2px}
+.setup-picker .btn{min-width:88px}
+.setup-pool-hint{font-size:13px;color:#999;margin-top:8px;line-height:1.4}
+.setup-pool-done{font-size:14px;font-weight:600;color:#27500a;margin-top:4px}
+.setup-guest-link{display:block;width:100%;text-align:center;margin-top:14px;padding:8px;background:none;border:none;font-size:13px;font-weight:600;color:#888;cursor:pointer;font-family:inherit;text-decoration:underline;text-underline-offset:3px}
+.setup-guest-link:hover{color:#555}
+.setup-guest-panel{margin-top:10px;padding-top:12px;border-top:1px solid #f0f0f0}
+.setup-footer-btns{display:flex;gap:10px;margin-top:18px;flex-wrap:wrap}
+.setup-footer-btns .btn{flex:1;min-width:120px;border-radius:14px;padding:12px 16px;font-weight:700}
 .pitch-svg{width:100%;border-radius:12px;cursor:crosshair;display:block}
 .pitch-tap-hint{font-size:12px;color:#999;text-align:center;margin-top:8px}
 .how-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
@@ -457,8 +502,10 @@ body{font-family:'Figtree',sans-serif;background:#f5f5f0;min-height:100vh;color:
 .step-dot.done{background:#111}
 .step-dot.active{background:#111;width:18px;border-radius:3px}
 .no-matches{text-align:center;padding:32px 16px;color:#bbb;font-size:14px}
-.match-history-item{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:0.5px solid #f5f5f0}
+.match-history-item{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:12px 0;border-bottom:0.5px solid #f5f5f0}
 .match-history-item:last-child{border-bottom:none}
+.match-history-item .mhi-block{flex:1;min-width:0}
+.match-history-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:flex-end}
 .mhi-score{font-size:18px;font-weight:900}
 .mhi-teams{font-size:12px;color:#999;margin-top:2px}
 .mhi-date{font-size:12px;color:#bbb;font-weight:500}
@@ -694,7 +741,7 @@ export default function App() {
         id: crypto.randomUUID(),
         date: new Date().toISOString(),
         team1: { name: "Bibs", color: "#f59e0b", players: [] },
-        team2: { name: "Skins", color: "#3b82f6", players: [] },
+        team2: { name: "Non-Bibs", color: "#3b82f6", players: [] },
         score1: 0,
         score2: 0,
         events: [],
@@ -849,11 +896,14 @@ export default function App() {
     if (!currentMatch || !canEdit) return;
     setState((prev) => {
       if (!prev.currentMatch) return prev;
-      const nextSeason = {
-        ...prev.season,
-        matches: [...prev.season.matches, prev.currentMatch],
-      };
-      const savedMatch = prev.currentMatch;
+      const cm = prev.currentMatch;
+      const idx = prev.season.matches.findIndex((m) => m.id === cm.id);
+      const nextMatches =
+        idx >= 0
+          ? prev.season.matches.map((m, i) => (i === idx ? cm : m))
+          : [...prev.season.matches, cm];
+      const nextSeason = { ...prev.season, matches: nextMatches };
+      const savedMatch = cm;
       const isAdmin = myPlayer?.is_admin === true;
       queueMicrotask(async () => {
         try {
@@ -872,8 +922,99 @@ export default function App() {
         season: nextSeason,
         currentMatch: null,
         view: "dashboard",
+        logStep: null,
+        logData: {},
       };
     });
+  };
+
+  const beginEditMatch = (m) => {
+    if (!canEdit) return;
+    let clone;
+    try {
+      clone = structuredClone(m);
+    } catch {
+      clone = JSON.parse(JSON.stringify(m));
+    }
+    update(() => ({
+      view: "live",
+      currentMatch: clone,
+      logStep: null,
+      logData: {},
+    }));
+  };
+
+  const deleteSavedMatch = (m) => {
+    if (!canEdit) return;
+    if (
+      !window.confirm(
+        `Delete this match (${fmtDate(m.date)} — ${m.team1.name} vs ${m.team2.name})? This cannot be undone.`
+      )
+    ) {
+      return;
+    }
+    const mid = m.id;
+    setState((prev) => {
+      const nextMatches = prev.season.matches.filter((x) => x.id !== mid);
+      const nextSeason = { ...prev.season, matches: nextMatches };
+      const isAdmin = myPlayer?.is_admin === true;
+      queueMicrotask(async () => {
+        try {
+          if (supabase && isAdmin && mid) await deleteAchievementsForMatchIds(supabase, [mid]);
+          await upsertSeasonToSupabase(nextSeason);
+        } catch (e) {
+          console.warn("Delete match / sync failed", e);
+        }
+      });
+      return {
+        ...prev,
+        season: nextSeason,
+        currentMatch: prev.currentMatch?.id === mid ? null : prev.currentMatch,
+        view: prev.currentMatch?.id === mid ? "history" : prev.view,
+        logStep: prev.currentMatch?.id === mid ? null : prev.logStep,
+        logData: prev.currentMatch?.id === mid ? {} : prev.logData,
+      };
+    });
+  };
+
+  const requestClearMatches = () => {
+    if (!supabase) return;
+    if (isAdminUser) {
+      if (
+        !window.confirm(
+          "Clear all logged matches? Your squad list is kept. This cannot be undone."
+        )
+      ) {
+        return;
+      }
+      setState((prev) => {
+        const ids = prev.season.matches.map((m) => m.id).filter(Boolean);
+        const nextSeason = { ...prev.season, matches: [] };
+        const isAdmin = myPlayer?.is_admin === true;
+        queueMicrotask(async () => {
+          try {
+            if (supabase && isAdmin && ids.length) await deleteAchievementsForMatchIds(supabase, ids);
+            await upsertSeasonToSupabase(nextSeason);
+          } catch (e) {
+            console.warn("Clear matches / sync failed", e);
+          }
+        });
+        return {
+          ...prev,
+          season: nextSeason,
+          currentMatch: null,
+          view: "history",
+          logStep: null,
+          logData: {},
+        };
+      });
+      return;
+    }
+    if (session?.user) {
+      showToast("Only admins can clear match history");
+      return;
+    }
+    openAuthModal("Clear match history", { kind: "clear_matches" });
   };
 
   // ── Event logging ──
@@ -1245,23 +1386,15 @@ export default function App() {
 
   // NEW MATCH SETUP
   const NewMatch = () => {
-    if (!canEdit) {
-      return (
-        <>
-          <button type="button" className="back-btn" onClick={() => update(() => ({ view: "dashboard", currentMatch: null }))}>
-            ← Back
-          </button>
-          <div className="card card-sm">
-            <p style={{ fontSize: 14, color: "#555" }}>Only admins can set up or log matches.</p>
-          </div>
-        </>
-      );
-    }
     const [lineup, setLineup] = useState(() => ({
       team1: currentMatch?.team1 || { name: "Bibs", color: "#f59e0b", players: [] },
-      team2: currentMatch?.team2 || { name: "Skins", color: "#3b82f6", players: [] },
+      team2: currentMatch?.team2 || { name: "Non-Bibs", color: "#3b82f6", players: [] },
     }));
     const [guestInp, setGuestInp] = useState("");
+    const [guestOpen, setGuestOpen] = useState(false);
+    const [poolSearch, setPoolSearch] = useState("");
+    const [pickingPlayer, setPickingPlayer] = useState(null);
+    const isEditingSaved = season.matches.some((m) => m.id === currentMatch?.id);
 
     const localTeam1 = lineup.team1;
     const localTeam2 = lineup.team2;
@@ -1274,6 +1407,41 @@ export default function App() {
       () => season.players.filter((p) => !assignedSet.has(p)),
       [season.players, assignedSet]
     );
+
+    const filteredPool = useMemo(() => {
+      const q = poolSearch.trim().toLowerCase();
+      if (!q) return squadAvailable;
+      return squadAvailable.filter((name) => name.toLowerCase().includes(q));
+    }, [squadAvailable, poolSearch]);
+
+    const squadAssignedCount = useMemo(
+      () => season.players.filter((p) => assignedSet.has(p)).length,
+      [season.players, assignedSet]
+    );
+    const squadTotal = season.players.length;
+
+    const searchMatchesOnlyAssigned = useMemo(() => {
+      const q = poolSearch.trim().toLowerCase();
+      if (!q || filteredPool.length > 0) return false;
+      return season.players.some((p) => p.toLowerCase().includes(q) && assignedSet.has(p));
+    }, [poolSearch, filteredPool.length, season.players, assignedSet]);
+
+    useEffect(() => {
+      if (pickingPlayer && !squadAvailable.includes(pickingPlayer)) setPickingPlayer(null);
+    }, [pickingPlayer, squadAvailable]);
+
+    if (!canEdit) {
+      return (
+        <>
+          <button type="button" className="back-btn" onClick={() => update(() => ({ view: "dashboard", currentMatch: null }))}>
+            ← Back
+          </button>
+          <div className="card card-sm">
+            <p style={{ fontSize: 14, color: "#555" }}>Only admins can set up or log matches.</p>
+          </div>
+        </>
+      );
+    }
 
     const addToTeam = (teamNum, rawName) => {
       const name = rawName.trim();
@@ -1298,6 +1466,7 @@ export default function App() {
     };
 
     const randomise = () => {
+      setPickingPlayer(null);
       setLineup((prev) => {
         const all = [...prev.team1.players, ...prev.team2.players];
         for (let i = all.length - 1; i > 0; i--) {
@@ -1319,102 +1488,184 @@ export default function App() {
       }));
     };
 
+    const assignFromPicker = (teamNum, name) => {
+      addToTeam(teamNum, name);
+      setPickingPlayer(null);
+    };
+
+    const headerTitle = isEditingSaved ? "Edit teams" : "Set up teams";
+
     return (
       <>
-        <button className="back-btn" onClick={() => update(() => ({ view: "dashboard", currentMatch: null }))}>
+        <button
+          className="back-btn"
+          onClick={() =>
+            update(() => ({
+              view: isEditingSaved ? "history" : "dashboard",
+              currentMatch: null,
+            }))
+          }
+        >
           ← Back
         </button>
-        <div style={{ fontWeight: 900, fontSize: 22, marginBottom: 16 }}>Set up teams</div>
 
-        <div className="card card-sm" style={{ marginBottom: 10 }}>
-          <div className="section-label">Squad</div>
-          {season.players.length === 0 ? (
-            <div style={{ fontSize: 13, color: "#999", marginBottom: 8 }}>
-              No one in your squad yet — add names in the Squad tab, or use a guest below.
-            </div>
-          ) : squadAvailable.length === 0 ? (
-            <div style={{ fontSize: 13, color: "#999" }}>Everyone from your squad is on a team. Remove someone to reassign, or add a guest.</div>
-          ) : (
-            <div className="squad-pick-list">
-              {squadAvailable.map((name) => (
-                <div className="squad-pick-row" key={name}>
-                  <span className="squad-pick-name">{name}</span>
-                  <div className="squad-pick-actions">
-                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => addToTeam(1, name)}>
-                      {localTeam1.name}
-                    </button>
-                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => addToTeam(2, name)}>
-                      {localTeam2.name}
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-          <div className="section-label" style={{ marginTop: 14 }}>Add guest (not in squad)</div>
-          <div className="guest-add-row">
-            <input
-              className="form-input"
-              style={{ padding: "8px 12px", fontSize: 13 }}
-              placeholder="Guest name..."
-              value={guestInp}
-              onChange={(e) => setGuestInp(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  addToTeam(1, guestInp);
-                  setGuestInp("");
-                }
-              }}
-            />
-            <button type="button" className="btn btn-ghost btn-sm" onClick={() => { addToTeam(1, guestInp); setGuestInp(""); }}>
-              → {localTeam1.name}
-            </button>
-            <button type="button" className="btn btn-ghost btn-sm" onClick={() => { addToTeam(2, guestInp); setGuestInp(""); }}>
-              → {localTeam2.name}
-            </button>
-          </div>
-          <button className="btn btn-ghost btn-sm" style={{ marginTop: 10 }} onClick={randomise}>
-            🎲 Randomise teams
-          </button>
+        <div className="setup-header-row">
+          <h1 className="setup-title">{headerTitle}</h1>
+          <span className="setup-counter-pill">
+            {squadTotal > 0
+              ? `${squadAssignedCount} of ${squadTotal} assigned`
+              : `${assignedSet.size} on teams`}
+          </span>
         </div>
 
         <div className="teams-grid">
           {[1, 2].map((t) => {
             const team = t === 1 ? localTeam1 : localTeam2;
             const tk = t === 1 ? "team1" : "team2";
+            const n = team.players.length;
             return (
-              <div className="card card-sm" key={t}>
-                <div className="team-label">
-                  <div className="team-dot" style={{ background: team.color }} />
-                  <input
-                    value={team.name}
-                    onChange={(e) =>
-                      setLineup((prev) => ({
-                        ...prev,
-                        [tk]: { ...prev[tk], name: e.target.value },
-                      }))
-                    }
-                    style={{ background: "none", border: "none", fontFamily: "inherit", fontWeight: 800, fontSize: 14, width: "100%", outline: "none", color: "#111" }}
-                  />
+              <div className="setup-team-card" key={t}>
+                <div className="setup-team-head">
+                  <div className="setup-team-title">
+                    <div className="team-dot" style={{ background: team.color }} aria-hidden />
+                    <input
+                      className="setup-team-name-input"
+                      value={team.name}
+                      onChange={(e) =>
+                        setLineup((prev) => ({
+                          ...prev,
+                          [tk]: { ...prev[tk], name: e.target.value },
+                        }))
+                      }
+                      aria-label={`Team ${t} name`}
+                    />
+                  </div>
+                  <span className="setup-team-count">{n} {n === 1 ? "player" : "players"}</span>
                 </div>
-                <div className="player-list">
-                  {team.players.length === 0 && <div style={{ fontSize: 12, color: "#bbb", padding: "4px 0" }}>No players yet</div>}
-                  {team.players.map((p, i) => (
-                    <div className="player-tag" key={`${p}-${i}`}>
-                      <span>{p}</span>
-                      <button type="button" onClick={() => removeP(t, i)}>×</button>
+                <div className="setup-team-avatars">
+                  {n === 0 ? (
+                    <div className="setup-team-empty" style={{ width: "100%" }}>
+                      No one yet
                     </div>
-                  ))}
+                  ) : (
+                    team.players.map((p, i) => (
+                      <button
+                        key={`${p}-${i}`}
+                        type="button"
+                        className="setup-avatar-btn"
+                        style={{ background: team.color }}
+                        title={`${p} — tap to unassign`}
+                        aria-label={`Remove ${p} from ${team.name}`}
+                        onClick={() => removeP(t, i)}
+                      >
+                        {initials(p)}
+                      </button>
+                    ))
+                  )}
                 </div>
               </div>
             );
           })}
         </div>
 
-        <button className="btn btn-primary" onClick={proceed} style={{ marginTop: 4 }}>
-          Kick off →
-        </button>
+        <div className="setup-pool-card">
+          <input
+            type="search"
+            className="form-input setup-search"
+            placeholder="Search players..."
+            value={poolSearch}
+            onChange={(e) => setPoolSearch(e.target.value)}
+            aria-label="Search players"
+          />
+          <div className="setup-pool-label">Tap to assign</div>
+          {season.players.length === 0 ? (
+            <div className="setup-pool-hint">
+              No one in your squad yet — add names in the Squad tab, or use <strong>+ Add guest</strong> below.
+            </div>
+          ) : squadAvailable.length === 0 ? (
+            <div className="setup-pool-done">Everyone assigned!</div>
+          ) : filteredPool.length === 0 ? (
+            <div className="setup-pool-hint">
+              {searchMatchesOnlyAssigned
+                ? "All names matching your search are already on a team."
+                : "No names match your search."}
+            </div>
+          ) : (
+            <div className="setup-pool-chips">
+              {filteredPool.map((name) => (
+                <div className="setup-chip-wrap" key={name}>
+                  <button
+                    type="button"
+                    className="setup-chip"
+                    onClick={() => setPickingPlayer((prev) => (prev === name ? null : name))}
+                    aria-expanded={pickingPlayer === name}
+                  >
+                    <span className="setup-chip-av" style={{ background: "#64748b" }}>
+                      {initials(name)}
+                    </span>
+                    {name}
+                  </button>
+                  {pickingPlayer === name && (
+                    <div className="setup-picker">
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => assignFromPicker(1, name)}
+                      >
+                        {localTeam1.name}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => assignFromPicker(2, name)}
+                      >
+                        {localTeam2.name}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          <button type="button" className="setup-guest-link" onClick={() => setGuestOpen((o) => !o)}>
+            + Add guest
+          </button>
+          {guestOpen && (
+            <div className="setup-guest-panel">
+              <div className="guest-add-row">
+                <input
+                  className="form-input"
+                  style={{ padding: "8px 12px", fontSize: 13 }}
+                  placeholder="Guest name..."
+                  value={guestInp}
+                  onChange={(e) => setGuestInp(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      addToTeam(1, guestInp);
+                      setGuestInp("");
+                    }
+                  }}
+                />
+                <button type="button" className="btn btn-ghost btn-sm" onClick={() => { addToTeam(1, guestInp); setGuestInp(""); }}>
+                  → {localTeam1.name}
+                </button>
+                <button type="button" className="btn btn-ghost btn-sm" onClick={() => { addToTeam(2, guestInp); setGuestInp(""); }}>
+                  → {localTeam2.name}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="setup-footer-btns">
+          <button type="button" className="btn btn-ghost" onClick={randomise}>
+            🎲 Randomise
+          </button>
+          <button type="button" className="btn btn-primary" onClick={proceed}>
+            Kick off →
+          </button>
+        </div>
       </>
     );
   };
@@ -1558,6 +1809,8 @@ export default function App() {
     const cm = currentMatch;
     if (!cm) return null;
 
+    const isEditingSaved = season.matches.some((m) => m.id === cm.id);
+
     const setMOTM = (name) => {
       if (!canEdit) return;
       update((prev) => ({
@@ -1579,6 +1832,14 @@ export default function App() {
         {!canEdit && (
           <div className="card card-sm" style={{ marginBottom: 10, background: "#fafafa" }}>
             <div style={{ fontSize: 12, color: "#666" }}>View only — admins log goals and save matches.</div>
+          </div>
+        )}
+
+        {canEdit && isEditingSaved && (
+          <div className="card card-sm" style={{ marginBottom: 10, background: "#f0f7ff", borderColor: "#cfe8ff" }}>
+            <div style={{ fontSize: 13, color: "#333", lineHeight: 1.45 }}>
+              Editing a saved match — adjust scores, goals, or MOTM, then <strong>Save</strong> to update. Use <strong>Discard</strong> to leave the stored match unchanged.
+            </div>
           </div>
         )}
 
@@ -1773,10 +2034,21 @@ export default function App() {
 
         {canEdit && (
           <button type="button" className="btn btn-green" onClick={saveCurrentMatch}>
-            ✓ Save match
+            {isEditingSaved ? "✓ Save changes" : "✓ Save match"}
           </button>
         )}
-        <button type="button" className="btn btn-ghost" onClick={() => update(() => ({ view: "dashboard", currentMatch: null }))}>
+        <button
+          type="button"
+          className="btn btn-ghost"
+          onClick={() =>
+            update(() => ({
+              view: isEditingSaved ? "history" : "dashboard",
+              currentMatch: null,
+              logStep: null,
+              logData: {},
+            }))
+          }
+        >
           {canEdit ? "Discard" : "Close"}
         </button>
       </>
@@ -1791,30 +2063,47 @@ export default function App() {
         <div className="card"><div className="no-matches">No matches logged yet.</div></div>
       ) : (
         <div className="card card-sm">
-          {[...season.matches].reverse().map((m, i) => {
+          {[...season.matches].reverse().map((m) => {
             const winner = m.score1 > m.score2 ? m.team1.name : m.score2 > m.score1 ? m.team2.name : null;
             return (
               <div className="match-history-item" key={m.id}>
-                <div>
+                <div className="mhi-block">
                   <div className="mhi-score">{m.score1} — {m.score2}</div>
                   <div className="mhi-teams">{m.team1.name} vs {m.team2.name}</div>
                 </div>
-                <div style={{ textAlign: "right" }}>
+                <div className="mhi-block" style={{ textAlign: "right" }}>
                   <div className="mhi-date">{fmtDate(m.date)}</div>
                   {winner
                     ? <div style={{ fontSize: 11, color: "#27500a", fontWeight: 700, marginTop: 2 }}>{winner} win</div>
                     : <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>Draw</div>}
                 </div>
+                {canEdit && (
+                  <div className="match-history-actions">
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => beginEditMatch(m)}>
+                      Edit
+                    </button>
+                    <button type="button" className="btn btn-danger btn-sm" onClick={() => deleteSavedMatch(m)}>
+                      Delete
+                    </button>
+                  </div>
+                )}
               </div>
             );
           })}
         </div>
       )}
-      {(isAdminUser || isGuest) && (
-        <button type="button" className="btn btn-danger btn-sm" onClick={requestResetSeason}>
-          Reset season
-        </button>
-      )}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 14 }}>
+        {(isAdminUser || isGuest) && season.matches.length > 0 && (
+          <button type="button" className="btn btn-danger btn-sm" onClick={requestClearMatches}>
+            Clear all matches
+          </button>
+        )}
+        {(isAdminUser || isGuest) && (
+          <button type="button" className="btn btn-danger btn-sm" onClick={requestResetSeason}>
+            Reset season
+          </button>
+        )}
+      </div>
     </>
   );
 
@@ -2112,6 +2401,41 @@ export default function App() {
               console.warn("Supabase save failed; data kept in local storage", e);
             });
             update(() => ({ season: empty }));
+          });
+          break;
+        case "clear_matches":
+          if (!row?.is_admin) {
+            toast("Only admins can clear match history");
+            break;
+          }
+          queueMicrotask(() => {
+            if (
+              !window.confirm(
+                "Clear all logged matches? Your squad list is kept. This cannot be undone."
+              )
+            ) {
+              return;
+            }
+            setState((prev) => {
+              const ids = prev.season.matches.map((m) => m.id).filter(Boolean);
+              const nextSeason = { ...prev.season, matches: [] };
+              queueMicrotask(async () => {
+                try {
+                  if (supabase && ids.length) await deleteAchievementsForMatchIds(supabase, ids);
+                  await upsertSeasonToSupabase(nextSeason);
+                } catch (e) {
+                  console.warn("Clear matches / sync failed", e);
+                }
+              });
+              return {
+                ...prev,
+                season: nextSeason,
+                currentMatch: null,
+                view: "history",
+                logStep: null,
+                logData: {},
+              };
+            });
           });
           break;
         case "squad_add": {

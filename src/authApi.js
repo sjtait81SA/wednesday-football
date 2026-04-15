@@ -176,6 +176,13 @@ export async function insertAchievementIfNew(supabase, playerId, type, matchId) 
   return data;
 }
 
+/** Remove match-scoped achievement rows (requires `achievements_delete_admin` RLS policy). */
+export async function deleteAchievementsForMatchIds(supabase, matchIds) {
+  if (!supabase || !matchIds?.length) return;
+  const { error } = await supabase.from("achievements").delete().in("match_id", matchIds);
+  if (error) console.warn("deleteAchievementsForMatchIds", error);
+}
+
 /** Build name → player id map (first match wins) */
 export async function fetchNameToPlayerIdMap(supabase) {
   if (!supabase) return new Map();
