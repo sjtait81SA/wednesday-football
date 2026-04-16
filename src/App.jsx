@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { supabase } from "./supabase.js";
-import { ACHIEVEMENT_META } from "./achievementsEngine.js";
+import { ACHIEVEMENT_META, PROFILE_ACHIEVEMENT_ORDER } from "./achievementsEngine.js";
 import {
   sendMagicLinkEmail,
   signOut,
@@ -14,6 +14,7 @@ import {
   fetchLatestAchievementFeed,
   syncSquadNamesToPlayers,
   fetchPlayerByName,
+  fetchPlayersByNames,
   seedPlayersIfEmpty,
 } from "./authApi.js";
 import { buildInitialSeason } from "./squad.js";
@@ -242,6 +243,8 @@ const defaultState = {
   logStep: null, // null | "pitch" | "goalmouth" | "how"
   logData: {},
   playerProfileName: null,
+  /** Where player profile was opened from — drives back navigation */
+  playerProfileFrom: "dashboard",
 };
 
 /** First visit (no localStorage): real squad + one demo match. */
@@ -268,11 +271,21 @@ function sanitizeAppState(raw) {
   if (!raw || typeof raw !== "object") return { ...defaultState };
   const playerProfileName =
     typeof raw.playerProfileName === "string" ? raw.playerProfileName : null;
+  const playerProfileFrom =
+    raw.playerProfileFrom === "squad" || raw.playerProfileFrom === "dashboard"
+      ? raw.playerProfileFrom
+      : "dashboard";
   let view =
     typeof raw.view === "string" && ALLOWED_VIEWS.includes(raw.view)
       ? raw.view
       : defaultState.view;
   if (view === "player_profile" && !playerProfileName) view = defaultState.view;
+  const logStepRaw = raw.logStep === null || typeof raw.logStep === "string" ? raw.logStep : null;
+  const logDataRaw =
+    raw.logData && typeof raw.logData === "object" && !Array.isArray(raw.logData) ? raw.logData : {};
+  /** Goal wizard only applies on Live; never persist it on other views (avoids hidden bottom nav). */
+  const logStep = view === "live" ? logStepRaw : null;
+  const logData = view === "live" ? logDataRaw : {};
   return {
     ...defaultState,
     ...raw,
@@ -283,11 +296,9 @@ function sanitizeAppState(raw) {
         : null,
     view,
     playerProfileName,
-    logStep: raw.logStep === null || typeof raw.logStep === "string" ? raw.logStep : null,
-    logData:
-      raw.logData && typeof raw.logData === "object" && !Array.isArray(raw.logData)
-        ? raw.logData
-        : {},
+    playerProfileFrom,
+    logStep,
+    logData,
   };
 }
 
@@ -364,6 +375,245 @@ function playerSeasonStats(season, playerName) {
     });
   });
   return { goals, ogs, apps };
+}
+
+const AVATAR_CYCLE = [
+  { bg: "#f59e0b", fg: "#3f2f06" },
+  { bg: "#3b82f6", fg: "#fff" },
+  { bg: "#22c55e", fg: "#052e16" },
+  { bg: "#a855f7", fg: "#fff" },
+  { bg: "#ef4444", fg: "#fff" },
+  { bg: "#9ca3af", fg: "#111827" },
+];
+
+function avatarCycleStyle(squadIndex) {
+  const i = ((squadIndex % AVATAR_CYCLE.length) + AVATAR_CYCLE.length) % AVATAR_CYCLE.length;
+  const c = AVATAR_CYCLE[i];
+  return { background: c.bg, color: c.fg };
+}
+
+function squadAvatarIndex(season, playerName) {
+  const idx = season.players.indexOf((playerName || "").trim());
+  return idx >= 0 ? idx : 0;
+}
+
+function sortedMatchesChrono(season) {
+  return [...(season.matches || [])].sort(
+    (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()
+  );
+}
+
+/** @returns {"W"|"L"|"D"|null} */
+function matchOutcomeForPlayer(m, playerName) {
+  const p = (playerName || "").trim();
+  const t1 = new Set((m.team1?.players || []).map((x) => (x || "").trim()).filter(Boolean));
+  const t2 = new Set((m.team2?.players || []).map((x) => (x || "").trim()).filter(Boolean));
+  let side = null;
+  if (t1.has(p)) side = 1;
+  else if (t2.has(p)) side = 2;
+  else return null;
+  const s1 = Number(m.score1) || 0;
+  const s2 = Number(m.score2) || 0;
+  if (s1 === s2) return "D";
+  if (side === 1) return s1 > s2 ? "W" : "L";
+  return s2 > s1 ? "W" : "L";
+}
+
+function lastNFormForPlayer(season, playerName, n = 5) {
+  const outcomes = [];
+  for (const m of sortedMatchesChrono(season)) {
+    const o = matchOutcomeForPlayer(m, playerName);
+    if (o != null) outcomes.push(o);
+  }
+  return outcomes.slice(-n);
+}
+
+function allFormForPlayer(season, playerName) {
+  const out = [];
+  for (const m of sortedMatchesChrono(season)) {
+    const o = matchOutcomeForPlayer(m, playerName);
+    if (o != null) out.push(o);
+  }
+  return out;
+}
+
+function motmCountForPlayer(season, playerName) {
+  const p = (playerName || "").trim();
+  let n = 0;
+  for (const m of season.matches || []) {
+    if ((m.motm || "").trim() === p) n += 1;
+  }
+  return n;
+}
+
+/** Counts optional `assister` / `assistBy` on goal events when present */
+function assistsForPlayer(season, playerName) {
+  const p = (playerName || "").trim();
+  let n = 0;
+  for (const m of season.matches || []) {
+    for (const ev of m.events || []) {
+      if (ev.type !== "goal") continue;
+      const ass = (ev.assister || ev.assistBy || "").trim();
+      if (ass === p) n += 1;
+    }
+  }
+  return n;
+}
+
+function winLossRecordFromForm(formArr) {
+  let w = 0;
+  let l = 0;
+  for (const o of formArr || []) {
+    if (o === "W") w += 1;
+    else if (o === "L") l += 1;
+  }
+  return { w, l };
+}
+
+function teammateTogetherStats(season, playerName, teammateName) {
+  const p = (playerName || "").trim();
+  const t = (teammateName || "").trim();
+  if (!p || !t || p === t) return { games: 0, w: 0, l: 0 };
+  let w = 0;
+  let l = 0;
+  let games = 0;
+  for (const m of sortedMatchesChrono(season)) {
+    const t1 = new Set((m.team1?.players || []).map((x) => (x || "").trim()).filter(Boolean));
+    const t2 = new Set((m.team2?.players || []).map((x) => (x || "").trim()).filter(Boolean));
+    const same = (t1.has(p) && t1.has(t)) || (t2.has(p) && t2.has(t));
+    if (!same) continue;
+    const o = matchOutcomeForPlayer(m, p);
+    if (!o) continue;
+    games += 1;
+    if (o === "W") w += 1;
+    else if (o === "L") l += 1;
+  }
+  return { games, w, l };
+}
+
+function bestWorstTeammatesLine(season, playerName, rosterNames) {
+  const rows = [];
+  for (const other of rosterNames) {
+    if (other === playerName) continue;
+    const st = teammateTogetherStats(season, playerName, other);
+    if (st.games < 1) continue;
+    rows.push({ name: other, ...st, rate: st.games ? st.w / st.games : 0 });
+  }
+  if (!rows.length) return { best: null, worst: null };
+  const best = rows.reduce((a, b) => (b.rate > a.rate ? b : a));
+  const worst = rows.reduce((a, b) => (b.rate < a.rate ? b : a));
+  return { best, worst };
+}
+
+function scoreAfterEventIndex(events, idxInclusive) {
+  let c1 = 0;
+  let c2 = 0;
+  const evs = events || [];
+  for (let i = 0; i <= idxInclusive && i < evs.length; i++) {
+    const e = evs[i];
+    if (e.type !== "goal") continue;
+    if (e.isOG || e.how === "own_goal") {
+      if (e.team === 1) c2 += 1;
+      else c1 += 1;
+    } else if (e.team === 1) c1 += 1;
+    else c2 += 1;
+  }
+  return { s1: c1, s2: c2 };
+}
+
+function goalLogEntriesForPlayer(season, playerName) {
+  const p = (playerName || "").trim();
+  const items = [];
+  for (const m of sortedMatchesChrono(season)) {
+    const evs = m.events || [];
+    for (let i = 0; i < evs.length; i++) {
+      const ev = evs[i];
+      if (ev.type !== "goal" || (ev.player || "").trim() !== p) continue;
+      const { s1, s2 } = scoreAfterEventIndex(evs, i);
+      const og = Boolean(ev.isOG || ev.how === "own_goal");
+      items.push({
+        id: ev.id,
+        ev,
+        m,
+        scoreLine: `${s1}–${s2}`,
+        date: m.date,
+        og,
+      });
+    }
+  }
+  return items.reverse();
+}
+
+function sameTeamLeaderboard(season, playerName, rosterNames) {
+  const rows = rosterNames
+    .filter((n) => n !== playerName)
+    .map((name) => ({ name, ...teammateTogetherStats(season, playerName, name) }))
+    .filter((r) => r.games > 0)
+    .sort((a, b) => b.games - a.games);
+  if (!rows.length) return { list: [], bestName: null, worstName: null };
+  const bestName = rows.reduce((a, b) => (b.w / b.games > a.w / a.games ? b : a)).name;
+  let worstName = rows.reduce((a, b) => (b.w / b.games < a.w / a.games ? b : a)).name;
+  if (worstName === bestName && rows.length > 1) worstName = null;
+  return { list: rows, bestName, worstName };
+}
+
+function formStreakSubtitle(formArr) {
+  const wins = (formArr || []).filter((x) => x === "W").length;
+  const losses = (formArr || []).filter((x) => x === "L").length;
+  let streak = 0;
+  let kind = null;
+  for (let i = formArr.length - 1; i >= 0; i--) {
+    const x = formArr[i];
+    if (x === "D") break;
+    if (kind == null) {
+      kind = x;
+      streak = 1;
+    } else if (x === kind) streak += 1;
+    else break;
+  }
+  const base = `${wins} wins, ${losses} losses`;
+  if (formArr.length && formArr[formArr.length - 1] === "D") return `${base} — last match was a draw`;
+  if (streak >= 2 && kind === "W") return `${base} — currently on a ${streak}-game win streak`;
+  if (streak >= 2 && kind === "L") return `${base} — currently on a ${streak}-game loss streak`;
+  if (streak === 1 && kind === "W") return `${base} — last match was a win`;
+  if (streak === 1 && kind === "L") return `${base} — last match was a loss`;
+  return base;
+}
+
+function totalNonOgGoalsSeason(season) {
+  let n = 0;
+  for (const m of season.matches || []) {
+    for (const ev of m.events || []) {
+      if (ev.type !== "goal" || !ev.player) continue;
+      if (ev.isOG || ev.how === "own_goal") continue;
+      n += 1;
+    }
+  }
+  return n;
+}
+
+function totalOgEventsSeason(season) {
+  let n = 0;
+  for (const m of season.matches || []) {
+    for (const ev of m.events || []) {
+      if (ev.type !== "goal") continue;
+      if (ev.isOG || ev.how === "own_goal") n += 1;
+    }
+  }
+  return n;
+}
+
+function achievementTitle(type) {
+  const meta = ACHIEVEMENT_META[type];
+  if (!meta) return type;
+  return (meta.label || "").split(" — ")[0].trim() || type;
+}
+
+function achievementDescription(type) {
+  const meta = ACHIEVEMENT_META[type];
+  if (!meta) return "";
+  const parts = (meta.label || "").split(" — ");
+  return parts.length > 1 ? parts.slice(1).join(" — ").trim() : "";
 }
 
 // ── Styles (injected) ─────────────────────────────────────────────────────────
@@ -544,6 +794,83 @@ body{font-family:'Figtree',sans-serif;background:#f5f5f0;min-height:100vh;color:
 .btn:disabled{opacity:0.45;cursor:not-allowed}
 .stat-row--click{cursor:pointer;border-radius:10px;transition:background 0.15s}
 .stat-row--click:hover{background:#fafafa}
+.squad-head-row{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:4px}
+.squad-count-pill{font-size:12px;font-weight:600;color:#666;background:#ececea;border-radius:999px;padding:6px 12px;white-space:nowrap}
+.squad-summary-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px}
+.squad-sum-tile{background:#fff;border-radius:14px;border:0.5px solid #e8e8e8;padding:12px 8px;text-align:center}
+.squad-sum-val{font-size:20px;font-weight:900;color:#111;line-height:1.1}
+.squad-sum-val--og{color:#e24b4a}
+.squad-sum-lbl{font-size:9px;font-weight:700;color:#999;text-transform:uppercase;letter-spacing:0.5px;margin-top:6px}
+.squad-lads-card{padding:14px 16px 16px}
+.squad-lad-row{border-bottom:0.5px solid #f0f0f0;padding:12px 0}
+.squad-lad-row:last-child{border-bottom:none;padding-bottom:0}
+.squad-lad-main{display:flex;align-items:flex-start;gap:10px;width:100%}
+.squad-lad-avatar{width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:900;flex-shrink:0;border:none;cursor:pointer;font-family:inherit;padding:0}
+.squad-lad-mid{flex:1;min-width:0}
+.squad-lad-name-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.squad-lad-name{font-size:15px;font-weight:800;color:#111;text-align:left;background:none;border:none;padding:0;cursor:pointer;font-family:inherit}
+.squad-admin-tag{display:inline-flex;align-items:center;gap:3px;font-size:10px;font-weight:800;color:#b45309}
+.squad-lad-meta{display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap}
+.squad-claim-pill{font-size:10px;font-weight:700;padding:3px 8px;border-radius:999px}
+.squad-claim-pill--yes{background:#eaf3de;color:#27500a}
+.squad-claim-pill--no{background:#f0f0f0;color:#888}
+.squad-form-dots{display:flex;align-items:center;gap:4px}
+.squad-form-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.squad-form-dot--w{background:#22c55e}
+.squad-form-dot--l{background:#ef4444}
+.squad-form-dot--d{background:#d1d5db}
+.squad-lad-right{text-align:right;flex-shrink:0;display:flex;flex-direction:column;align-items:flex-end;gap:4px}
+.squad-lad-goals{font-size:20px;font-weight:900;color:#111;line-height:1}
+.squad-lad-goals-lbl{font-size:10px;font-weight:600;color:#999}
+.squad-lad-ach-row{display:flex;flex-wrap:wrap;gap:3px;justify-content:flex-end;max-width:120px}
+.squad-lad-ach{font-size:14px;line-height:1;opacity:1}
+.squad-expand-btn{width:28px;height:28px;border-radius:8px;border:0.5px solid #e8e8e8;background:#fafafa;color:#666;font-size:14px;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-family:inherit;padding:0}
+.squad-expand-panel{padding:12px 0 0;margin-top:8px;border-top:0.5px dashed #e8e8e8}
+.squad-mini-stat-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:12px}
+.squad-mini-stat{background:#f7f7f5;border-radius:12px;padding:10px 8px;text-align:center}
+.squad-mini-stat-v{font-size:18px;font-weight:900;color:#111}
+.squad-mini-stat-l{font-size:9px;font-weight:700;color:#999;text-transform:uppercase;margin-top:4px}
+.squad-ach-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}
+.squad-ach-cell{border-radius:10px;padding:8px 6px;text-align:center;font-size:10px;font-weight:700;color:#444;line-height:1.25}
+.squad-ach-cell--on{background:#fff9e6;border:1px solid #f0e6c8}
+.squad-ach-cell--off{background:#f5f5f5;border:1px solid #ececec;filter:grayscale(1);opacity:0.2}
+.squad-ach-emoji{font-size:18px;display:block;margin-bottom:4px}
+.squad-buddy-line{font-size:12px;color:#555;line-height:1.45;margin-bottom:12px}
+.profile-back-bar{display:flex;align-items:center;margin-bottom:6px}
+.profile-hero{display:flex;flex-direction:column;align-items:center;text-align:center;padding:8px 0 4px}
+.profile-hero-av{width:64px;height:64px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:900;margin-bottom:12px}
+.profile-hero-name{font-size:26px;font-weight:900;color:#111;letter-spacing:-0.4px;line-height:1.1}
+.profile-hero-sub{font-size:13px;color:#888;margin-top:6px;font-weight:600}
+.profile-hero-you{font-size:11px;font-weight:700;color:#378add;margin-top:8px;letter-spacing:0.04em;text-transform:uppercase}
+.profile-ach-pill{display:inline-flex;align-items:center;gap:6px;margin-top:10px;padding:6px 12px;border-radius:999px;background:#fff9e6;border:1px solid #f0e6c8;font-size:12px;font-weight:700;color:#333}
+.profile-stat-grid-6{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:12px}
+.profile-stat-cell{border-radius:12px;padding:12px 10px;text-align:center}
+.profile-stat-cell--g{background:#e8f1ff}
+.profile-stat-cell--a{background:#faeeda}
+.profile-stat-cell--og{background:#fcebeb}
+.profile-stat-cell--n{background:#f5f5f5}
+.profile-stat-v{font-size:20px;font-weight:900;color:#111;line-height:1}
+.profile-stat-l{font-size:9px;font-weight:700;color:#666;text-transform:uppercase;margin-top:6px;letter-spacing:0.04em}
+.form-strip-wrap{margin-top:12px}
+.form-strip-dots{display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin-bottom:8px}
+.form-strip-dot{width:10px;height:10px;border-radius:50%}
+.form-strip-sub{font-size:12px;color:#666;line-height:1.45;font-weight:600}
+.profile-ach-grid-2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.profile-ach-tile{border-radius:12px;padding:12px;display:flex;gap:10px;align-items:flex-start}
+.profile-ach-tile--on{background:#fff9e6;border:1px solid #f0e6c8}
+.profile-ach-tile--off{background:#fff;border:1px solid #ececec;opacity:0.4}
+.profile-ach-tile-emoji{font-size:22px;line-height:1;flex-shrink:0}
+.profile-ach-tile-t{font-size:12px;font-weight:800;color:#111}
+.profile-ach-tile-d{font-size:11px;color:#666;margin-top:3px;line-height:1.35}
+.profile-ach-tile--off .profile-ach-tile-t,.profile-ach-tile--off .profile-ach-tile-d{color:#999}
+.goal-log-item{padding:12px 0;border-bottom:0.5px solid #f0f0f0}
+.goal-log-item:last-child{border-bottom:none}
+.same-team-row{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:0.5px solid #f0f0f0}
+.same-team-row:last-child{border-bottom:none}
+.same-team-row--best{background:linear-gradient(90deg,#eaf3de 0%,transparent 100%);border-radius:10px;padding-left:8px;margin:0 -8px;padding-right:8px}
+.same-team-row--worst{background:linear-gradient(90deg,#fcebeb 0%,transparent 100%);border-radius:10px;padding-left:8px;margin:0 -8px;padding-right:8px}
+.same-team-meta{font-size:12px;font-weight:700;color:#666;margin-left:auto;white-space:nowrap}
+.sec-tight{margin-bottom:8px}
 .auth-sheet-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:300;display:flex;align-items:flex-end;justify-content:center}
 .auth-sheet-backdrop--center{align-items:center;justify-content:center;padding:24px}
 .auth-sheet{width:100%;max-width:440px;background:#fff;border-radius:20px 20px 0 0;padding:20px 20px 28px;box-shadow:0 -8px 40px rgba(0,0,0,0.12);max-height:85vh;overflow:auto}
@@ -666,7 +993,7 @@ export default function App() {
 
   const update = (fn) => setState(prev => ({ ...prev, ...fn(prev) }));
 
-  const { season, currentMatch, view, logStep, logData, playerProfileName } = state;
+  const { season, currentMatch, view, logStep, logData, playerProfileName, playerProfileFrom } = state;
   const canEdit = myPlayer?.is_admin === true;
   const isGuest = !session?.user;
   const isAdminUser = myPlayer?.is_admin === true;
@@ -829,6 +1156,7 @@ export default function App() {
       logStep: null,
       logData: {},
       playerProfileName: null,
+      playerProfileFrom: "dashboard",
     }));
   };
 
@@ -1310,11 +1638,21 @@ export default function App() {
                       tabIndex={0}
                       className={`stat-row stat-row--click${myPlayer?.name === name ? " stat-row--me" : ""}`}
                       key={name}
-                      onClick={() => update(() => ({ view: "player_profile", playerProfileName: name }))}
+                      onClick={() =>
+                        update(() => ({
+                          view: "player_profile",
+                          playerProfileName: name,
+                          playerProfileFrom: "dashboard",
+                        }))
+                      }
                       onKeyDown={(e) => {
                         if (e.key === "Enter" || e.key === " ") {
                           e.preventDefault();
-                          update(() => ({ view: "player_profile", playerProfileName: name }));
+                          update(() => ({
+                            view: "player_profile",
+                            playerProfileName: name,
+                            playerProfileFrom: "dashboard",
+                          }));
                         }
                       }}
                     >
@@ -1340,11 +1678,21 @@ export default function App() {
                       tabIndex={0}
                       className={`stat-row stat-row--click${myPlayer?.name === name ? " stat-row--me" : ""}`}
                       key={name}
-                      onClick={() => update(() => ({ view: "player_profile", playerProfileName: name }))}
+                      onClick={() =>
+                        update(() => ({
+                          view: "player_profile",
+                          playerProfileName: name,
+                          playerProfileFrom: "dashboard",
+                        }))
+                      }
                       onKeyDown={(e) => {
                         if (e.key === "Enter" || e.key === " ") {
                           e.preventDefault();
-                          update(() => ({ view: "player_profile", playerProfileName: name }));
+                          update(() => ({
+                            view: "player_profile",
+                            playerProfileName: name,
+                            playerProfileFrom: "dashboard",
+                          }));
                         }
                       }}
                     >
@@ -1433,7 +1781,13 @@ export default function App() {
     if (!canEdit) {
       return (
         <>
-          <button type="button" className="back-btn" onClick={() => update(() => ({ view: "dashboard", currentMatch: null }))}>
+          <button
+            type="button"
+            className="back-btn"
+            onClick={() =>
+              update(() => ({ view: "dashboard", currentMatch: null, logStep: null, logData: {} }))
+            }
+          >
             ← Back
           </button>
           <div className="card card-sm">
@@ -1503,6 +1857,8 @@ export default function App() {
             update(() => ({
               view: isEditingSaved ? "history" : "dashboard",
               currentMatch: null,
+              logStep: null,
+              logData: {},
             }))
           }
         >
@@ -1695,12 +2051,322 @@ export default function App() {
 
   const Squad = () => {
     const [addInp, setAddInp] = useState("");
+    const [squadExpanded, setSquadExpanded] = useState(null);
+    const [squadDbByName, setSquadDbByName] = useState({});
+    const [squadAchById, setSquadAchById] = useState({});
+
+    const squadListKey = season.players.join("\n");
+
+    useEffect(() => {
+      let cancelled = false;
+      (async () => {
+        if (!supabase || !season.players.length) {
+          if (!cancelled) {
+            setSquadDbByName({});
+            setSquadAchById({});
+          }
+          return;
+        }
+        try {
+          await syncSquadNamesToPlayers(supabase, season.players);
+          const rows = await fetchPlayersByNames(supabase, season.players);
+          if (cancelled) return;
+          const map = {};
+          (rows || []).forEach((r) => {
+            const k = (r.name || "").trim();
+            if (k) map[k] = r;
+          });
+          setSquadDbByName(map);
+          const ach = {};
+          await Promise.all(
+            (rows || []).map(async (r) => {
+              if (!r.id) return;
+              const list = await fetchAchievementsForPlayer(supabase, r.id);
+              if (!cancelled) ach[r.id] = list;
+            })
+          );
+          if (!cancelled) setSquadAchById(ach);
+        } catch (e) {
+          console.warn("Squad player sync / achievements load", e);
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }, [squadListKey]);
+
+    const claimedCount = useMemo(() => {
+      let n = 0;
+      for (const nm of season.players) {
+        if (squadDbByName[nm]?.claimed_by) n += 1;
+      }
+      return n;
+    }, [season.players, squadDbByName]);
+
+    const nPlayers = season.players.length;
+    const seasonGoalsTot = useMemo(() => totalNonOgGoalsSeason(season), [season]);
+    const seasonOgsTot = useMemo(() => totalOgEventsSeason(season), [season]);
+
+    const openProfile = (name) => {
+      update(() => ({
+        view: "player_profile",
+        playerProfileName: name,
+        playerProfileFrom: "squad",
+      }));
+    };
+
+    const toggleExpand = (name) => {
+      setSquadExpanded((prev) => (prev === name ? null : name));
+    };
+
     return (
       <>
-        <div className="topbar">
-          <div className="topbar-logo">Squad 👥</div>
-          <div className="topbar-week">Roster</div>
+        <div className="squad-head-row">
+          <div className="topbar-logo" style={{ marginBottom: 0 }}>
+            Squad 👥
+          </div>
+          <div className="squad-count-pill">{nPlayers} players</div>
         </div>
+
+        {nPlayers > 0 && (
+          <div className="squad-summary-grid">
+            <div className="squad-sum-tile">
+              <div className="squad-sum-val">{claimedCount}</div>
+              <div className="squad-sum-lbl">Claimed</div>
+            </div>
+            <div className="squad-sum-tile">
+              <div className="squad-sum-val">{seasonGoalsTot}</div>
+              <div className="squad-sum-lbl">Season goals</div>
+            </div>
+            <div className="squad-sum-tile">
+              <div className="squad-sum-val squad-sum-val--og">
+                {seasonOgsTot}
+                <span style={{ marginLeft: 2 }}>😬</span>
+              </div>
+              <div className="squad-sum-lbl">OGs</div>
+            </div>
+          </div>
+        )}
+
+        <div className="card card-sm squad-lads-card">
+          <div className="section-label sec-tight">The lads</div>
+          {nPlayers === 0 ? (
+            <div className="empty-state">No players saved yet.</div>
+          ) : (
+            season.players.map((name) => {
+              const idx = squadAvatarIndex(season, name);
+              const avStyle = avatarCycleStyle(idx);
+              const stats = playerSeasonStats(season, name);
+              const form = lastNFormForPlayer(season, name, 5);
+              const row = squadDbByName[name];
+              const earnedList = row?.id ? squadAchById[row.id] || [] : [];
+              const earnedSet = new Set(earnedList.map((a) => a.type));
+              const isOpen = squadExpanded === name;
+              const { best, worst } = bestWorstTeammatesLine(season, name, season.players);
+              const showClaimBtn =
+                Boolean(row?.id) &&
+                row.claimed_by == null &&
+                session?.user &&
+                !myPlayer &&
+                supabase;
+
+              const claimThisProfile = () => {
+                if (!row?.id) return;
+                if (!session?.user) {
+                  openAuthModal("Claim your profile", { kind: "claim_player", meta: { playerId: row.id } });
+                  return;
+                }
+                (async () => {
+                  try {
+                    await claimPlayerRow(supabase, row.id);
+                    await refreshMyPlayer();
+                    setSquadDbByName((prev) => ({
+                      ...prev,
+                      [name]: { ...row, claimed_by: session.user.id },
+                    }));
+                    showToast("Profile claimed");
+                    setSquadExpanded(null);
+                  } catch (e) {
+                    showToast(e?.message || "Could not claim profile");
+                  }
+                })();
+              };
+
+              return (
+                <div className="squad-lad-row" key={name}>
+                  <div className="squad-lad-main">
+                    <button
+                      type="button"
+                      className="squad-expand-btn"
+                      aria-expanded={isOpen}
+                      aria-label={isOpen ? "Collapse" : "Expand"}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        toggleExpand(name);
+                      }}
+                    >
+                      {isOpen ? "▾" : "▸"}
+                    </button>
+                    <button
+                      type="button"
+                      className="squad-lad-avatar"
+                      style={avStyle}
+                      onClick={() => openProfile(name)}
+                    >
+                      {initials(name)}
+                    </button>
+                    <div className="squad-lad-mid">
+                      <div className="squad-lad-name-row">
+                        <button type="button" className="squad-lad-name" onClick={() => openProfile(name)}>
+                          {name}
+                        </button>
+                        {row?.is_admin === true && (
+                          <span className="squad-admin-tag" title="Admin">
+                            ⭐ Admin
+                          </span>
+                        )}
+                        {(isAdminUser || isGuest) && (
+                          <button
+                            type="button"
+                            style={{
+                              marginLeft: 4,
+                              border: "none",
+                              background: "none",
+                              color: "#ccc",
+                              cursor: "pointer",
+                              fontSize: 18,
+                              lineHeight: 1,
+                              padding: "0 4px",
+                            }}
+                            aria-label={`Remove ${name}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (isAdminUser) removeSquadPlayer(name);
+                              else
+                                requestSquadAdmin(() => removeSquadPlayer(name), {
+                                  kind: "squad_remove",
+                                  meta: { name },
+                                });
+                            }}
+                          >
+                            ×
+                          </button>
+                        )}
+                      </div>
+                      <div className="squad-lad-meta">
+                        <span
+                          className={`squad-claim-pill ${
+                            row?.claimed_by ? "squad-claim-pill--yes" : "squad-claim-pill--no"
+                          }`}
+                        >
+                          {row?.claimed_by ? "✓ Claimed" : "Unclaimed"}
+                        </span>
+                        <div className="squad-form-dots" aria-label="Last five results">
+                          {form.map((o, i) => (
+                            <span
+                              key={`${name}-f-${i}`}
+                              className={`squad-form-dot ${
+                                o === "W" ? "squad-form-dot--w" : o === "L" ? "squad-form-dot--l" : "squad-form-dot--d"
+                              }`}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className="squad-lad-right"
+                      onClick={() => openProfile(name)}
+                      style={{
+                        background: "none",
+                        border: "none",
+                        cursor: "pointer",
+                        fontFamily: "inherit",
+                        display: "flex",
+                        flexDirection: "column",
+                        alignItems: "flex-end",
+                      }}
+                    >
+                      <div className="squad-lad-goals">{stats.goals}</div>
+                      <div className="squad-lad-goals-lbl">goals</div>
+                      <div className="squad-lad-ach-row">
+                        {PROFILE_ACHIEVEMENT_ORDER.filter((t) => earnedSet.has(t)).map((t) => (
+                          <span key={t} className="squad-lad-ach" title={achievementTitle(t)}>
+                            {ACHIEVEMENT_META[t]?.emoji || "🏅"}
+                          </span>
+                        ))}
+                      </div>
+                    </button>
+                  </div>
+
+                  {isOpen && (
+                    <div className="squad-expand-panel">
+                      <div className="squad-mini-stat-grid">
+                        <div className="squad-mini-stat">
+                          <div className="squad-mini-stat-v">{stats.goals}</div>
+                          <div className="squad-mini-stat-l">Goals</div>
+                        </div>
+                        <div className="squad-mini-stat">
+                          <div className="squad-mini-stat-v">{assistsForPlayer(season, name)}</div>
+                          <div className="squad-mini-stat-l">Assists</div>
+                        </div>
+                        <div className="squad-mini-stat">
+                          <div className="squad-mini-stat-v">{motmCountForPlayer(season, name)}</div>
+                          <div className="squad-mini-stat-l">MOTM</div>
+                        </div>
+                      </div>
+
+                      <div className="squad-ach-grid">
+                        {PROFILE_ACHIEVEMENT_ORDER.map((t) => {
+                          const on = earnedSet.has(t);
+                          const meta = ACHIEVEMENT_META[t];
+                          return (
+                            <div key={t} className={`squad-ach-cell ${on ? "squad-ach-cell--on" : "squad-ach-cell--off"}`}>
+                              <span className="squad-ach-emoji">{meta?.emoji || "🏅"}</span>
+                              {achievementTitle(t)}
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      {best && worst && (
+                        <div className="squad-buddy-line">
+                          {best.name === worst.name ? (
+                            <>
+                              Most with:{" "}
+                              <strong>
+                                {best.name} ({best.w}W {best.l}L)
+                              </strong>
+                            </>
+                          ) : (
+                            <>
+                              Best with:{" "}
+                              <strong>
+                                {best.name} ({best.w}W {best.l}L)
+                              </strong>
+                              {" · "}
+                              Worst with:{" "}
+                              <strong>
+                                {worst.name} ({worst.w}W {worst.l}L)
+                              </strong>
+                            </>
+                          )}
+                        </div>
+                      )}
+
+                      {showClaimBtn && (
+                        <button type="button" className="btn btn-primary btn-sm" onClick={claimThisProfile}>
+                          Claim this profile
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </div>
+
         <div className="card card-sm">
           <div className="section-label">Add player</div>
           {isAdminUser ? (
@@ -1767,39 +2433,6 @@ export default function App() {
             <p style={{ fontSize: 13, color: "#888" }}>Only admins can change the squad.</p>
           )}
         </div>
-        <div className="card card-sm">
-          <div className="section-label">Saved players</div>
-          {season.players.length === 0 ? (
-            <div className="empty-state">No players saved yet.</div>
-          ) : (
-            <div className="player-list">
-              {season.players.map((name) => (
-                <div className="player-tag" key={name}>
-                  <span>{name}</span>
-                  {isAdminUser && (
-                    <button type="button" onClick={() => removeSquadPlayer(name)} aria-label={`Remove ${name}`}>
-                      ×
-                    </button>
-                  )}
-                  {isGuest && (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        requestSquadAdmin(() => removeSquadPlayer(name), {
-                          kind: "squad_remove",
-                          meta: { name },
-                        })
-                      }
-                      aria-label={`Remove ${name}`}
-                    >
-                      ×
-                    </button>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
       </>
     );
   };
@@ -1823,7 +2456,17 @@ export default function App() {
     return (
       <>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-          <button className="back-btn" onClick={() => update(() => ({ view: canEdit ? "new_match" : "dashboard", currentMatch: canEdit ? cm : null }))}>
+          <button
+            className="back-btn"
+            onClick={() =>
+              update(() => ({
+                view: canEdit ? "new_match" : "dashboard",
+                currentMatch: canEdit ? cm : null,
+                logStep: null,
+                logData: {},
+              }))
+            }
+          >
             ← {canEdit ? "Setup" : "Back"}
           </button>
           <span style={{ fontSize: 12, color: "#999", fontWeight: 600 }}>Live</span>
@@ -2137,6 +2780,18 @@ export default function App() {
     const [row, setRow] = useState(null);
     const [pAch, setPAch] = useState([]);
     const stats = useMemo(() => playerSeasonStats(season, name), [season, name]);
+    const formAll = useMemo(() => allFormForPlayer(season, name), [season, name]);
+    const wl = useMemo(() => winLossRecordFromForm(formAll), [formAll]);
+    const assists = useMemo(() => assistsForPlayer(season, name), [season, name]);
+    const motmN = useMemo(() => motmCountForPlayer(season, name), [season, name]);
+    const gpg = stats.apps > 0 ? (stats.goals / stats.apps).toFixed(1) : "0.0";
+    const goalLog = useMemo(() => goalLogEntriesForPlayer(season, name), [season, name]);
+    const sameTeam = useMemo(
+      () => sameTeamLeaderboard(season, name, season.players),
+      [season, name]
+    );
+    const avIdx = squadAvatarIndex(season, name);
+    const avStyle = avatarCycleStyle(avIdx);
 
     useEffect(() => {
       let cancelled = false;
@@ -2162,7 +2817,14 @@ export default function App() {
     }, [name]);
 
     const isMe = myPlayer && row && myPlayer.id === row.id;
-    const showClaimCta = Boolean(row && row.claimed_by == null && !myPlayer);
+    const showClaimCta = Boolean(supabase && row?.id && row.claimed_by == null && session?.user && !myPlayer);
+    const earnedSet = useMemo(() => new Set(pAch.map((a) => a.type)), [pAch]);
+    const latestAch = useMemo(() => {
+      const sorted = [...pAch].sort(
+        (a, b) => new Date(b.earned_at || 0).getTime() - new Date(a.earned_at || 0).getTime()
+      );
+      return sorted[0] || null;
+    }, [pAch]);
 
     const claimThisPlayer = () => {
       if (!row?.id) return;
@@ -2178,69 +2840,167 @@ export default function App() {
         try {
           await claimPlayerRow(supabase, row.id);
           await refreshMyPlayer();
-          update(() => ({ view: "profile", playerProfileName: null }));
+          update(() => ({ view: "profile", playerProfileName: null, playerProfileFrom: "dashboard" }));
         } catch (e) {
           showToast(e?.message || "Could not claim profile");
         }
       })();
     };
 
+    const goBack = () => {
+      const v = playerProfileFrom === "squad" ? "squad" : "dashboard";
+      update(() => ({ view: v, playerProfileName: null, playerProfileFrom: "dashboard" }));
+    };
+
+    const backLabel = playerProfileFrom === "squad" ? "← Squad" : "← Dashboard";
+
     return (
       <>
-        <button
-          type="button"
-          className="back-btn"
-          onClick={() => update(() => ({ view: "dashboard", playerProfileName: null }))}
-        >
-          ← Back
-        </button>
-        <div className="topbar">
-          <div className="topbar-logo">{name || "Player"}</div>
-          <div className="topbar-week">Profile</div>
+        <div className="profile-back-bar">
+          <button type="button" className="back-btn" onClick={goBack} style={{ marginBottom: 0 }}>
+            {backLabel}
+          </button>
         </div>
-        <div className="card card-sm">
-          <div className="section-label">Season stats</div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, textAlign: "center" }}>
-            <div>
-              <div style={{ fontSize: 22, fontWeight: 900 }}>{stats.goals}</div>
-              <div style={{ fontSize: 11, color: "#888" }}>Goals</div>
+
+        <div className="card">
+          <div className="profile-hero">
+            <div className="profile-hero-av" style={avStyle}>
+              {initials(name)}
             </div>
-            <div>
-              <div style={{ fontSize: 22, fontWeight: 900 }}>{stats.ogs}</div>
-              <div style={{ fontSize: 11, color: "#888" }}>Own goals</div>
+            <div className="profile-hero-name">{name || "Player"}</div>
+            <div className="profile-hero-sub">
+              Season 1 · {stats.apps} appearance{stats.apps === 1 ? "" : "s"}
             </div>
-            <div>
-              <div style={{ fontSize: 22, fontWeight: 900 }}>{stats.apps}</div>
-              <div style={{ fontSize: 11, color: "#888" }}>Appearances</div>
+            {latestAch && ACHIEVEMENT_META[latestAch.type] && (
+              <div className="profile-ach-pill">
+                <span>{ACHIEVEMENT_META[latestAch.type].emoji}</span>
+                <span>{achievementTitle(latestAch.type)}</span>
+              </div>
+            )}
+            {isMe && <div className="profile-hero-you">Your profile</div>}
+          </div>
+
+          <div className="profile-stat-grid-6">
+            <div className="profile-stat-cell profile-stat-cell--g">
+              <div className="profile-stat-v">{stats.goals}</div>
+              <div className="profile-stat-l">Goals</div>
+            </div>
+            <div className="profile-stat-cell profile-stat-cell--a">
+              <div className="profile-stat-v">{assists}</div>
+              <div className="profile-stat-l">Assists</div>
+            </div>
+            <div className="profile-stat-cell profile-stat-cell--og">
+              <div className="profile-stat-v">
+                {stats.ogs} <span style={{ fontSize: 14 }}>😬</span>
+              </div>
+              <div className="profile-stat-l">Own goals</div>
+            </div>
+            <div className="profile-stat-cell profile-stat-cell--n">
+              <div className="profile-stat-v">{motmN}</div>
+              <div className="profile-stat-l">MOTM</div>
+            </div>
+            <div className="profile-stat-cell profile-stat-cell--n">
+              <div className="profile-stat-v">{gpg}</div>
+              <div className="profile-stat-l">Goals / game</div>
+            </div>
+            <div className="profile-stat-cell profile-stat-cell--n">
+              <div className="profile-stat-v">
+                {wl.w}W {wl.l}L
+              </div>
+              <div className="profile-stat-l">Record</div>
             </div>
           </div>
-        </div>
-        <div className="card">
-          <div className="section-label">Achievements</div>
-          {pAch.length === 0 ? (
-            <p style={{ fontSize: 14, color: "#999" }}>None yet.</p>
-          ) : (
-            <div className="profile-badges" role="list">
-              {pAch.map((ar) => {
-                const meta = ACHIEVEMENT_META[ar.type];
-                return (
-                  <span
-                    key={ar.id}
-                    className="ach-badge"
-                    role="listitem"
-                    title={meta?.label || ar.type}
-                    aria-label={meta?.label || ar.type}
-                  >
-                    {meta?.emoji || "🏅"}
-                  </span>
-                );
-              })}
+
+          <div className="form-strip-wrap">
+            <div className="section-label sec-tight">Form</div>
+            <div className="form-strip-dots">
+              {formAll.map((o, i) => (
+                <span
+                  key={`pf-${i}`}
+                  className={`form-strip-dot ${
+                    o === "W" ? "squad-form-dot--w" : o === "L" ? "squad-form-dot--l" : "squad-form-dot--d"
+                  }`}
+                />
+              ))}
             </div>
+            <div className="form-strip-sub">{formStreakSubtitle(formAll)}</div>
+          </div>
+        </div>
+
+        <div className="card card-sm">
+          <div className="section-label">Achievements</div>
+          <div className="profile-ach-grid-2">
+            {PROFILE_ACHIEVEMENT_ORDER.map((t) => {
+              const on = earnedSet.has(t);
+              const meta = ACHIEVEMENT_META[t];
+              return (
+                <div key={t} className={`profile-ach-tile ${on ? "profile-ach-tile--on" : "profile-ach-tile--off"}`}>
+                  <div className="profile-ach-tile-emoji">{meta?.emoji || "🏅"}</div>
+                  <div>
+                    <div className="profile-ach-tile-t">{achievementTitle(t)}</div>
+                    <div className="profile-ach-tile-d">{achievementDescription(t) || meta?.label || ""}</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="card card-sm">
+          <div className="section-label">Goal log (this season)</div>
+          {goalLog.length === 0 ? (
+            <div className="empty-state">No goals logged yet.</div>
+          ) : (
+            goalLog.map((item) => (
+              <div className="goal-log-item" key={item.id}>
+                <div className="goal-name">
+                  {item.og ? (
+                    <>
+                      <span style={{ marginRight: 4 }}>😬</span>
+                      <span style={{ color: "#e24b4a", fontWeight: 800 }}>(OG)</span>
+                    </>
+                  ) : null}{" "}
+                  {item.ev.quip}
+                  {item.ev.gmQuip ? ` ${item.ev.gmQuip}` : ""}
+                </div>
+                <div className="goal-desc" style={{ marginTop: 4 }}>
+                  {item.m.team1?.name} {item.scoreLine} {item.m.team2?.name} · {fmtDate(item.date)}
+                </div>
+              </div>
+            ))
           )}
         </div>
-        {isMe && (
-          <p style={{ fontSize: 13, color: "#666", textAlign: "center" }}>This is you — full details in Profile.</p>
-        )}
+
+        <div className="card card-sm">
+          <div className="section-label">Same team as</div>
+          {sameTeam.list.length === 0 ? (
+            <div className="empty-state">No shared matches yet.</div>
+          ) : (
+            sameTeam.list.map((r) => {
+              const cls =
+                r.name === sameTeam.bestName
+                  ? "same-team-row same-team-row--best"
+                  : r.name === sameTeam.worstName
+                    ? "same-team-row same-team-row--worst"
+                    : "same-team-row";
+              const oidx = squadAvatarIndex(season, r.name);
+              return (
+                <div className={cls} key={r.name}>
+                  <div className="avatar" style={{ ...avatarCycleStyle(oidx), width: 32, height: 32, fontSize: 10 }}>
+                    {initials(r.name)}
+                  </div>
+                  <div className="stat-name" style={{ flex: 1 }}>
+                    {r.name}
+                  </div>
+                  <div className="same-team-meta">
+                    {r.w}W {r.l}L together
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+
         {showClaimCta && (
           <button type="button" className="btn btn-primary" onClick={claimThisPlayer}>
             Claim this profile
@@ -2667,7 +3427,7 @@ export default function App() {
           <button
             type="button"
             className={`nav-btn ${view === "dashboard" ? "active" : ""}`}
-            onClick={() => update(() => ({ view: "dashboard" }))}
+            onClick={() => update(() => ({ view: "dashboard", logStep: null, logData: {} }))}
           >
             <span className="nav-icon">🏠</span>Home
           </button>
@@ -2684,14 +3444,14 @@ export default function App() {
           <button
             type="button"
             className={`nav-btn ${view === "squad" ? "active" : ""}`}
-            onClick={() => update(() => ({ view: "squad" }))}
+            onClick={() => update(() => ({ view: "squad", logStep: null, logData: {} }))}
           >
             <span className="nav-icon">👤</span>Squad
           </button>
           <button
             type="button"
             className={`nav-btn ${view === "history" ? "active" : ""}`}
-            onClick={() => update(() => ({ view: "history" }))}
+            onClick={() => update(() => ({ view: "history", logStep: null, logData: {} }))}
           >
             <span className="nav-icon">📋</span>History
           </button>

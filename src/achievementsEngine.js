@@ -8,11 +8,25 @@ export const ACHIEVEMENT_META = {
   ghost: { emoji: "👻", label: "Ghost — missed 3 weeks in a row" },
   dave_award: { emoji: "😬", label: "Wooden spoon — most own goals (season)" },
   penalty_merchant: { emoji: "🎯", label: "Penalty merchant — 3+ pens" },
+  sniper: { emoji: "🔭", label: "Sniper — long-range specialist" },
   headers_fc: { emoji: "🗣️", label: "Headers FC — 3+ headers" },
   liability: { emoji: "⚠️", label: "Liability — more OGs than goals (2+ OGs)" },
   golden_boot: { emoji: "👟", label: "Golden boot — top scorer" },
   rode_the_bench: { emoji: "🪑", label: "Rode the bench — 8+ apps, 0 goals" },
 };
+
+/** Order for squad accordion + player profile achievement grids */
+export const PROFILE_ACHIEVEMENT_ORDER = [
+  "on_fire",
+  "golden_boot",
+  "sniper",
+  "penalty_merchant",
+  "headers_fc",
+  "liability",
+  "ghost",
+  "dave_award",
+  "rode_the_bench",
+];
 
 function normName(n) {
   return (n || "").trim();
