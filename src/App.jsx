@@ -1264,8 +1264,9 @@ export default function App() {
     } catch {
       clone = JSON.parse(JSON.stringify(m));
     }
+    /** Lineup screen first so admins confirm who played before scores / goals / MOTM. */
     update(() => ({
-      view: "live",
+      view: "new_match",
       currentMatch: clone,
       logStep: null,
       logData: {},
@@ -1576,6 +1577,16 @@ export default function App() {
                     {[...(lastMatch.team1.players || []), ...(lastMatch.team2.players || [])].length} lads
                   </span>
                 </div>
+                {canEdit && (
+                  <button
+                    type="button"
+                    className="btn btn-ghost"
+                    style={{ marginTop: 14 }}
+                    onClick={() => beginEditMatch(lastMatch)}
+                  >
+                    Amend match — lineups &amp; scores
+                  </button>
+                )}
               </div>
 
               {lastMatch.events?.length > 0 && (
@@ -1839,6 +1850,8 @@ export default function App() {
       update(() => ({
         currentMatch: { ...currentMatch, team1: lineup.team1, team2: lineup.team2, status: "live" },
         view: "live",
+        logStep: null,
+        logData: {},
       }));
     };
 
@@ -1847,11 +1860,12 @@ export default function App() {
       setPickingPlayer(null);
     };
 
-    const headerTitle = isEditingSaved ? "Edit teams" : "Set up teams";
+    const headerTitle = isEditingSaved ? "Amend match — lineups" : "Set up teams";
 
     return (
       <>
         <button
+          type="button"
           className="back-btn"
           onClick={() =>
             update(() => ({
@@ -1862,8 +1876,17 @@ export default function App() {
             }))
           }
         >
-          ← Back
+          ← {isEditingSaved ? "History" : "Back"}
         </button>
+
+        {isEditingSaved && (
+          <div className="card card-sm" style={{ marginBottom: 12, background: "#f7faf7", borderColor: "#dce8dc" }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#1a3d1a", marginBottom: 6 }}>Confirm who played</div>
+            <p style={{ fontSize: 13, color: "#444", lineHeight: 1.5, margin: 0 }}>
+              Assign everyone to <strong>{localTeam1.name}</strong> or <strong>{localTeam2.name}</strong>, then continue to adjust the score, goals, and MOTM. Nothing is saved until you tap <strong>Save changes</strong> on the next screen.
+            </p>
+          </div>
+        )}
 
         <div className="setup-header-row">
           <h1 className="setup-title">{headerTitle}</h1>
@@ -2019,7 +2042,7 @@ export default function App() {
             🎲 Randomise
           </button>
           <button type="button" className="btn btn-primary" onClick={proceed}>
-            Kick off →
+            {isEditingSaved ? "Confirm lineups →" : "Kick off →"}
           </button>
         </div>
       </>
@@ -2457,6 +2480,7 @@ export default function App() {
       <>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
           <button
+            type="button"
             className="back-btn"
             onClick={() =>
               update(() => ({
@@ -2467,9 +2491,9 @@ export default function App() {
               }))
             }
           >
-            ← {canEdit ? "Setup" : "Back"}
+            ← {canEdit ? (isEditingSaved ? "Edit lineups" : "Setup") : "Back"}
           </button>
-          <span style={{ fontSize: 12, color: "#999", fontWeight: 600 }}>Live</span>
+          <span style={{ fontSize: 12, color: "#999", fontWeight: 600 }}>{isEditingSaved ? "Amend" : "Live"}</span>
         </div>
 
         {!canEdit && (
@@ -2481,7 +2505,7 @@ export default function App() {
         {canEdit && isEditingSaved && (
           <div className="card card-sm" style={{ marginBottom: 10, background: "#f0f7ff", borderColor: "#cfe8ff" }}>
             <div style={{ fontSize: 13, color: "#333", lineHeight: 1.45 }}>
-              Editing a saved match — adjust scores, goals, or MOTM, then <strong>Save</strong> to update. Use <strong>Discard</strong> to leave the stored match unchanged.
+              Editing a saved match — use <strong>Edit lineups</strong> above to change who played. Adjust scores, goals, or MOTM here, then <strong>Save changes</strong> to update. <strong>Discard</strong> leaves the stored match unchanged.
             </div>
           </div>
         )}
@@ -2723,7 +2747,7 @@ export default function App() {
                 {canEdit && (
                   <div className="match-history-actions">
                     <button type="button" className="btn btn-ghost btn-sm" onClick={() => beginEditMatch(m)}>
-                      Edit
+                      Amend
                     </button>
                     <button type="button" className="btn btn-danger btn-sm" onClick={() => deleteSavedMatch(m)}>
                       Delete
