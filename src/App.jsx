@@ -17,7 +17,6 @@ import {
   fetchPlayersByNames,
   seedPlayersIfEmpty,
 } from "./authApi.js";
-import { buildInitialSeason } from "./squad.js";
 
 const WNF_PENDING_AUTH_KEY = "wnf-pending-auth";
 
@@ -39,24 +38,50 @@ function writePendingAuth(payload) {
   }
 }
 
-// ── Storage (local fallback when Supabase is unavailable) ───────────────────
+// ── Storage: season cache only (Supabase is source of truth) ────────────────
 const SK = "wnf-v2";
 const SEASON_ID = "wednesday-fc";
 
-const loadLocal = () => {
+/** @returns normalized season or null */
+function loadSeasonCache() {
   try {
     const r = localStorage.getItem(SK);
-    return r ? JSON.parse(r) : null;
+    if (!r) return null;
+    const raw = JSON.parse(r);
+    if (!raw || typeof raw !== "object") return null;
+    if (raw.season != null && typeof raw.season === "object") {
+      return normalizeSeason(raw.season);
+    }
+    if (Array.isArray(raw.matches) || Array.isArray(raw.players)) {
+      return normalizeSeason(raw);
+    }
+    return null;
   } catch {
     return null;
   }
-};
+}
 
-const saveLocal = (s) => {
+function saveSeasonCache(season) {
   try {
-    localStorage.setItem(SK, JSON.stringify(s));
-  } catch {}
-};
+    localStorage.setItem(SK, JSON.stringify({ season: normalizeSeason(season) }));
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Human-readable relative time for last sync (compact). */
+function formatSyncAge(ts) {
+  if (ts == null || Number.isNaN(ts)) return "";
+  const sec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (sec < 10) return "Just now";
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 48) return `${hr}h ago`;
+  const d = Math.floor(hr / 24);
+  return `${d}d ago`;
+}
 
 /** Legacy default side name; rename on load so UI matches current terminology. */
 function migrateTeamName(t) {
@@ -246,61 +271,6 @@ const defaultState = {
   /** Where player profile was opened from — drives back navigation */
   playerProfileFrom: "dashboard",
 };
-
-/** First visit (no localStorage): real squad + one demo match. */
-function createInitialClientState() {
-  return {
-    ...defaultState,
-    season: normalizeSeason(buildInitialSeason()),
-  };
-}
-
-const ALLOWED_VIEWS = [
-  "dashboard",
-  "new_match",
-  "live",
-  "squad",
-  "history",
-  "profile",
-  "player_profile",
-  "account",
-];
-
-/** Merge saved localStorage with defaults so a bad/corrupt snapshot never crashes the first render. */
-function sanitizeAppState(raw) {
-  if (!raw || typeof raw !== "object") return { ...defaultState };
-  const playerProfileName =
-    typeof raw.playerProfileName === "string" ? raw.playerProfileName : null;
-  const playerProfileFrom =
-    raw.playerProfileFrom === "squad" || raw.playerProfileFrom === "dashboard"
-      ? raw.playerProfileFrom
-      : "dashboard";
-  let view =
-    typeof raw.view === "string" && ALLOWED_VIEWS.includes(raw.view)
-      ? raw.view
-      : defaultState.view;
-  if (view === "player_profile" && !playerProfileName) view = defaultState.view;
-  const logStepRaw = raw.logStep === null || typeof raw.logStep === "string" ? raw.logStep : null;
-  const logDataRaw =
-    raw.logData && typeof raw.logData === "object" && !Array.isArray(raw.logData) ? raw.logData : {};
-  /** Goal wizard only applies on Live; never persist it on other views (avoids hidden bottom nav). */
-  const logStep = view === "live" ? logStepRaw : null;
-  const logData = view === "live" ? logDataRaw : {};
-  return {
-    ...defaultState,
-    ...raw,
-    season: normalizeSeason(raw.season),
-    currentMatch:
-      raw.currentMatch != null && typeof raw.currentMatch === "object"
-        ? migrateMatchTeams(raw.currentMatch)
-        : null,
-    view,
-    playerProfileName,
-    playerProfileFrom,
-    logStep,
-    logData,
-  };
-}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function initials(name) {
@@ -882,11 +852,29 @@ body{font-family:'Figtree',sans-serif;background:#f5f5f0;min-height:100vh;color:
 .auth-sheet-close:hover{background:#ebebeb}
 .topbar-link{background:none;border:none;font-size:13px;font-weight:600;color:#888;cursor:pointer;padding:6px 4px;font-family:inherit;text-decoration:underline;text-underline-offset:3px}
 .topbar-link:hover{color:#111}
+.app-loading{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:50vh;gap:12px;color:#555;font-size:15px;font-weight:600}
+.app-loading-spinner{width:36px;height:36px;border-radius:50%;border:3px solid #e8e8e8;border-top-color:#111;animation:wnfspin 0.75s linear infinite}
+@keyframes wnfspin{to{transform:rotate(360deg)}}
+.offline-banner{background:#fff5f5;border:1px solid #fecaca;color:#991b1b;font-size:13px;font-weight:600;padding:10px 14px;border-radius:12px;margin-bottom:4px;line-height:1.4}
+.sync-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.sync-btn{width:34px;height:34px;border-radius:10px;border:0.5px solid #e0e0e0;background:#fff;cursor:pointer;font-size:16px;line-height:1;display:flex;align-items:center;justify-content:center;padding:0;font-family:inherit}
+.sync-btn:hover:not(:disabled){background:#f5f5f0;border-color:#ccc}
+.sync-btn:disabled{opacity:0.5;cursor:default}
+.sync-age{font-size:11px;font-weight:600;color:#888;white-space:nowrap}
+.sync-age--bad{color:#b91c1c}
 `;
 
 // ── App ───────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [state, setState] = useState(() => sanitizeAppState(loadLocal() ?? createInitialClientState()));
+  const [state, setState] = useState(() => ({
+    ...defaultState,
+    season: normalizeSeason({ matches: [], players: [] }),
+  }));
+  const [seasonLoadStatus, setSeasonLoadStatus] = useState("loading");
+  const [bootFromCache, setBootFromCache] = useState(false);
+  const [lastSyncedAt, setLastSyncedAt] = useState(null);
+  const [lastSyncFailed, setLastSyncFailed] = useState(false);
+  const [seasonRefreshing, setSeasonRefreshing] = useState(false);
   const [session, setSession] = useState(null);
   const [myPlayer, setMyPlayer] = useState(null);
   const [authModal, setAuthModal] = useState({ open: false, subtitle: "" });
@@ -903,9 +891,15 @@ export default function App() {
   const [profileAch, setProfileAch] = useState([]);
   const [toastMsg, setToastMsg] = useState("");
 
+  const seasonRef = useRef(state.season);
+  seasonRef.current = state.season;
+  const currentMatchRef = useRef(state.currentMatch);
+  currentMatchRef.current = state.currentMatch;
+
   useEffect(() => {
-    saveLocal(state);
-  }, [state]);
+    if (seasonLoadStatus !== "ready") return;
+    saveSeasonCache(state.season);
+  }, [state.season, seasonLoadStatus]);
 
   useEffect(() => {
     if (!supabase) {
@@ -950,31 +944,14 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      if (!supabase) return;
-      try {
-        const remote = await fetchSeasonFromSupabase();
-        if (cancelled || remote == null) return;
-        setState((prev) => ({ ...prev, season: remote }));
-      } catch (e) {
-        console.warn("Supabase season load failed; using local cache", e);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      if (!supabase) return;
+      if (!supabase || seasonLoadStatus !== "ready") return;
       const row = await fetchLatestAchievementFeed(supabase);
       if (!cancelled) setLatestAchNotif(row);
     })();
     return () => {
       cancelled = true;
     };
-  }, [state.season?.matches?.length]);
+  }, [state.season?.matches?.length, seasonLoadStatus]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1003,6 +980,55 @@ export default function App() {
     setToastMsg(msg);
     window.setTimeout(() => setToastMsg(""), 2800);
   };
+
+  const refreshSeasonFromSupabase = async () => {
+    if (!supabase) return;
+    setSeasonRefreshing(true);
+    try {
+      const remote = await fetchSeasonFromSupabase();
+      const next = remote != null ? remote : normalizeSeason({ matches: [], players: [] });
+      setState((prev) => ({ ...prev, season: next }));
+      saveSeasonCache(next);
+      setLastSyncedAt(Date.now());
+      setLastSyncFailed(false);
+      setBootFromCache(false);
+    } catch (e) {
+      setLastSyncFailed(true);
+      showToast(e?.message || "Could not refresh");
+    } finally {
+      setSeasonRefreshing(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!supabase) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const remote = await fetchSeasonFromSupabase();
+        if (cancelled) return;
+        const next =
+          remote != null ? remote : normalizeSeason({ matches: [], players: [] });
+        setState((prev) => ({ ...prev, season: next }));
+        saveSeasonCache(next);
+        setLastSyncedAt(Date.now());
+        setLastSyncFailed(false);
+        setBootFromCache(false);
+      } catch (e) {
+        if (cancelled) return;
+        const cached = loadSeasonCache();
+        const next = cached ?? normalizeSeason({ matches: [], players: [] });
+        setState((prev) => ({ ...prev, season: next }));
+        setLastSyncFailed(true);
+        setBootFromCache(true);
+      } finally {
+        if (!cancelled) setSeasonLoadStatus("ready");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const refreshMyPlayer = async () => {
     if (!supabase) return;
@@ -1109,10 +1135,17 @@ export default function App() {
     if (isAdminUser) {
       if (!window.confirm("Reset entire season? This cannot be undone.")) return;
       const empty = { matches: [], players: [] };
-      upsertSeasonToSupabase(empty).catch((e) => {
-        console.warn("Supabase save failed; data kept in local storage", e);
-      });
-      update(() => ({ season: empty }));
+      (async () => {
+        try {
+          await upsertSeasonToSupabase(empty);
+          update(() => ({ season: empty }));
+          setLastSyncedAt(Date.now());
+          setLastSyncFailed(false);
+          showToast("Saved ✓");
+        } catch (e) {
+          showToast(e?.message || "Could not reset season");
+        }
+      })();
       return;
     }
     if (session?.user) {
@@ -1183,14 +1216,16 @@ export default function App() {
     setAuthErr("");
     try {
       await insertPlayerRow(supabase, name, true);
-      setState((prev) => {
-        const players = prev.season.players.includes(name)
-          ? prev.season.players
-          : [...prev.season.players, name];
-        const nextSeason = { ...prev.season, players };
-        upsertSeasonToSupabase(nextSeason).catch((err) => console.warn("Season sync failed", err));
-        return { ...prev, season: nextSeason };
-      });
+      const prevSeason = seasonRef.current;
+      const players = prevSeason.players.includes(name)
+        ? prevSeason.players
+        : [...prevSeason.players, name];
+      const nextSeason = { ...prevSeason, players };
+      await upsertSeasonToSupabase(nextSeason);
+      setState((prev) => ({ ...prev, season: nextSeason }));
+      setLastSyncedAt(Date.now());
+      setLastSyncFailed(false);
+      showToast("Saved ✓");
       await refreshMyPlayer();
       setGuestClaimName("");
       setClaimSheetOpen(false);
@@ -1220,40 +1255,39 @@ export default function App() {
     beginNewMatch();
   };
 
-  const saveCurrentMatch = () => {
-    if (!currentMatch || !canEdit) return;
-    setState((prev) => {
-      if (!prev.currentMatch) return prev;
-      const cm = prev.currentMatch;
-      const idx = prev.season.matches.findIndex((m) => m.id === cm.id);
-      const nextMatches =
-        idx >= 0
-          ? prev.season.matches.map((m, i) => (i === idx ? cm : m))
-          : [...prev.season.matches, cm];
-      const nextSeason = { ...prev.season, matches: nextMatches };
-      const savedMatch = cm;
-      const isAdmin = myPlayer?.is_admin === true;
-      queueMicrotask(async () => {
-        try {
-          await upsertSeasonToSupabase(nextSeason);
-          if (supabase && isAdmin) {
-            await processAchievementsForSavedMatch(supabase, nextSeason, savedMatch);
-            const feed = await fetchLatestAchievementFeed(supabase);
-            setLatestAchNotif(feed);
-          }
-        } catch (e) {
-          console.warn("Save / achievements failed", e);
-        }
-      });
-      return {
+  const saveCurrentMatch = async () => {
+    if (!currentMatch || !canEdit || !supabase) return;
+    const cm = currentMatchRef.current;
+    if (!cm) return;
+    const prevSeason = seasonRef.current;
+    const idx = prevSeason.matches.findIndex((m) => m.id === cm.id);
+    const nextMatches =
+      idx >= 0
+        ? prevSeason.matches.map((m, i) => (i === idx ? cm : m))
+        : [...prevSeason.matches, cm];
+    const nextSeason = { ...prevSeason, matches: nextMatches };
+    const isAdmin = myPlayer?.is_admin === true;
+    try {
+      await upsertSeasonToSupabase(nextSeason);
+      if (supabase && isAdmin) {
+        await processAchievementsForSavedMatch(supabase, nextSeason, cm);
+        const feed = await fetchLatestAchievementFeed(supabase);
+        setLatestAchNotif(feed);
+      }
+      setState((prev) => ({
         ...prev,
         season: nextSeason,
         currentMatch: null,
         view: "dashboard",
         logStep: null,
         logData: {},
-      };
-    });
+      }));
+      setLastSyncedAt(Date.now());
+      setLastSyncFailed(false);
+      showToast("Saved ✓");
+    } catch (e) {
+      showToast(e?.message || "Could not save match");
+    }
   };
 
   const beginEditMatch = (m) => {
@@ -1273,8 +1307,8 @@ export default function App() {
     }));
   };
 
-  const deleteSavedMatch = (m) => {
-    if (!canEdit) return;
+  const deleteSavedMatch = async (m) => {
+    if (!canEdit || !supabase) return;
     if (
       !window.confirm(
         `Delete this match (${fmtDate(m.date)} — ${m.team1.name} vs ${m.team2.name})? This cannot be undone.`
@@ -1283,27 +1317,26 @@ export default function App() {
       return;
     }
     const mid = m.id;
-    setState((prev) => {
-      const nextMatches = prev.season.matches.filter((x) => x.id !== mid);
-      const nextSeason = { ...prev.season, matches: nextMatches };
-      const isAdmin = myPlayer?.is_admin === true;
-      queueMicrotask(async () => {
-        try {
-          if (supabase && isAdmin && mid) await deleteAchievementsForMatchIds(supabase, [mid]);
-          await upsertSeasonToSupabase(nextSeason);
-        } catch (e) {
-          console.warn("Delete match / sync failed", e);
-        }
-      });
-      return {
+    const prevSeason = seasonRef.current;
+    const nextSeason = { ...prevSeason, matches: prevSeason.matches.filter((x) => x.id !== mid) };
+    const isAdmin = myPlayer?.is_admin === true;
+    try {
+      if (supabase && isAdmin && mid) await deleteAchievementsForMatchIds(supabase, [mid]);
+      await upsertSeasonToSupabase(nextSeason);
+      setState((prev) => ({
         ...prev,
         season: nextSeason,
         currentMatch: prev.currentMatch?.id === mid ? null : prev.currentMatch,
         view: prev.currentMatch?.id === mid ? "history" : prev.view,
         logStep: prev.currentMatch?.id === mid ? null : prev.logStep,
         logData: prev.currentMatch?.id === mid ? {} : prev.logData,
-      };
-    });
+      }));
+      setLastSyncedAt(Date.now());
+      setLastSyncFailed(false);
+      showToast("Saved ✓");
+    } catch (e) {
+      showToast(e?.message || "Could not delete match");
+    }
   };
 
   const requestClearMatches = () => {
@@ -1316,27 +1349,28 @@ export default function App() {
       ) {
         return;
       }
-      setState((prev) => {
-        const ids = prev.season.matches.map((m) => m.id).filter(Boolean);
-        const nextSeason = { ...prev.season, matches: [] };
+      (async () => {
+        const ids = seasonRef.current.matches.map((m) => m.id).filter(Boolean);
+        const nextSeason = { ...seasonRef.current, matches: [] };
         const isAdmin = myPlayer?.is_admin === true;
-        queueMicrotask(async () => {
-          try {
-            if (supabase && isAdmin && ids.length) await deleteAchievementsForMatchIds(supabase, ids);
-            await upsertSeasonToSupabase(nextSeason);
-          } catch (e) {
-            console.warn("Clear matches / sync failed", e);
-          }
-        });
-        return {
-          ...prev,
-          season: nextSeason,
-          currentMatch: null,
-          view: "history",
-          logStep: null,
-          logData: {},
-        };
-      });
+        try {
+          if (supabase && isAdmin && ids.length) await deleteAchievementsForMatchIds(supabase, ids);
+          await upsertSeasonToSupabase(nextSeason);
+          setState((prev) => ({
+            ...prev,
+            season: nextSeason,
+            currentMatch: null,
+            view: "history",
+            logStep: null,
+            logData: {},
+          }));
+          setLastSyncedAt(Date.now());
+          setLastSyncFailed(false);
+          showToast("Saved ✓");
+        } catch (e) {
+          showToast(e?.message || "Could not clear matches");
+        }
+      })();
       return;
     }
     if (session?.user) {
@@ -1478,6 +1512,27 @@ export default function App() {
             </div>
             <div className="topbar-week" style={{ opacity: 0.85 }}>
               {season.matches.length > 0 ? `Week ${season.matches.length}` : "Season start"}
+            </div>
+            <div className="sync-bar">
+              <button
+                type="button"
+                className="sync-btn"
+                aria-label="Refresh season from server"
+                title="Refresh from server"
+                disabled={seasonRefreshing}
+                onClick={() => refreshSeasonFromSupabase()}
+              >
+                {seasonRefreshing ? "…" : "↻"}
+              </button>
+              <span
+                className={`sync-age${lastSyncFailed ? " sync-age--bad" : ""}`}
+              >
+                {lastSyncedAt != null
+                  ? `Updated ${formatSyncAge(lastSyncedAt)}`
+                  : bootFromCache || lastSyncFailed
+                    ? "Offline copy"
+                    : "—"}
+              </span>
             </div>
             {isGuest && (
               <button
@@ -2049,27 +2104,36 @@ export default function App() {
     );
   };
 
-  const addSquadPlayer = (raw) => {
+  const addSquadPlayer = async (raw) => {
     const name = raw.trim();
-    if (!name) return;
-    setState((prev) => {
-      if (prev.season.players.includes(name)) return prev;
-      const nextSeason = { ...prev.season, players: [...prev.season.players, name] };
-      upsertSeasonToSupabase(nextSeason).catch((e) => {
-        console.warn("Supabase save failed; squad kept in local storage", e);
-      });
-      return { ...prev, season: nextSeason };
-    });
+    if (!name || !supabase) return;
+    const prevSeason = seasonRef.current;
+    if (prevSeason.players.includes(name)) return;
+    const nextSeason = { ...prevSeason, players: [...prevSeason.players, name] };
+    try {
+      await upsertSeasonToSupabase(nextSeason);
+      setState((prev) => ({ ...prev, season: nextSeason }));
+      setLastSyncedAt(Date.now());
+      setLastSyncFailed(false);
+      showToast("Saved ✓");
+    } catch (e) {
+      showToast(e?.message || "Could not save squad");
+    }
   };
 
-  const removeSquadPlayer = (name) => {
-    setState((prev) => {
-      const nextSeason = { ...prev.season, players: prev.season.players.filter((p) => p !== name) };
-      upsertSeasonToSupabase(nextSeason).catch((e) => {
-        console.warn("Supabase save failed; squad kept in local storage", e);
-      });
-      return { ...prev, season: nextSeason };
-    });
+  const removeSquadPlayer = async (name) => {
+    if (!supabase) return;
+    const prevSeason = seasonRef.current;
+    const nextSeason = { ...prevSeason, players: prevSeason.players.filter((p) => p !== name) };
+    try {
+      await upsertSeasonToSupabase(nextSeason);
+      setState((prev) => ({ ...prev, season: nextSeason }));
+      setLastSyncedAt(Date.now());
+      setLastSyncFailed(false);
+      showToast("Saved ✓");
+    } catch (e) {
+      showToast(e?.message || "Could not save squad");
+    }
   };
 
   const Squad = () => {
@@ -3148,11 +3212,6 @@ export default function App() {
       const row = await fetchMyPlayer(supabase);
       setMyPlayer(row ?? null);
 
-      const toast = (msg) => {
-        setToastMsg(msg);
-        window.setTimeout(() => setToastMsg(""), 2800);
-      };
-
       switch (pending.kind) {
         case "claim":
           openClaimSheetFromState();
@@ -3165,34 +3224,39 @@ export default function App() {
             await refreshMyPlayer();
             update(() => ({ view: "profile", playerProfileName: null }));
           } catch (e) {
-            toast(e?.message || "Could not claim profile");
+            showToast(e?.message || "Could not claim profile");
           }
           break;
         }
         case "log_match":
           if (row?.is_admin) queueMicrotask(() => beginNewMatch());
-          else toast("Only admins can log matches");
+          else showToast("Only admins can log matches");
           break;
         case "reset_season":
           if (!row?.is_admin) {
-            toast("Only admins can reset the season");
+            showToast("Only admins can reset the season");
             break;
           }
-          queueMicrotask(() => {
+          queueMicrotask(async () => {
             if (!window.confirm("Reset entire season? This cannot be undone.")) return;
             const empty = { matches: [], players: [] };
-            upsertSeasonToSupabase(empty).catch((e) => {
-              console.warn("Supabase save failed; data kept in local storage", e);
-            });
-            update(() => ({ season: empty }));
+            try {
+              await upsertSeasonToSupabase(empty);
+              update(() => ({ season: empty }));
+              setLastSyncedAt(Date.now());
+              setLastSyncFailed(false);
+              showToast("Saved ✓");
+            } catch (e) {
+              showToast(e?.message || "Could not reset season");
+            }
           });
           break;
         case "clear_matches":
           if (!row?.is_admin) {
-            toast("Only admins can clear match history");
+            showToast("Only admins can clear match history");
             break;
           }
-          queueMicrotask(() => {
+          queueMicrotask(async () => {
             if (
               !window.confirm(
                 "Clear all logged matches? Your squad list is kept. This cannot be undone."
@@ -3200,62 +3264,69 @@ export default function App() {
             ) {
               return;
             }
-            setState((prev) => {
-              const ids = prev.season.matches.map((m) => m.id).filter(Boolean);
-              const nextSeason = { ...prev.season, matches: [] };
-              queueMicrotask(async () => {
-                try {
-                  if (supabase && ids.length) await deleteAchievementsForMatchIds(supabase, ids);
-                  await upsertSeasonToSupabase(nextSeason);
-                } catch (e) {
-                  console.warn("Clear matches / sync failed", e);
-                }
-              });
-              return {
+            const ids = seasonRef.current.matches.map((m) => m.id).filter(Boolean);
+            const nextSeason = { ...seasonRef.current, matches: [] };
+            try {
+              if (supabase && ids.length) await deleteAchievementsForMatchIds(supabase, ids);
+              await upsertSeasonToSupabase(nextSeason);
+              setState((prev) => ({
                 ...prev,
                 season: nextSeason,
                 currentMatch: null,
                 view: "history",
                 logStep: null,
                 logData: {},
-              };
-            });
+              }));
+              setLastSyncedAt(Date.now());
+              setLastSyncFailed(false);
+              showToast("Saved ✓");
+            } catch (e) {
+              showToast(e?.message || "Could not clear matches");
+            }
           });
           break;
         case "squad_add": {
           const nm = (pending.meta?.name || "").trim();
           if (!row?.is_admin) {
-            toast("Only admins can change the squad");
+            showToast("Only admins can change the squad");
             break;
           }
           if (!nm) break;
-          queueMicrotask(() => {
-            setState((prev) => {
-              if (prev.season.players.includes(nm)) return prev;
-              const nextSeason = { ...prev.season, players: [...prev.season.players, nm] };
-              upsertSeasonToSupabase(nextSeason).catch((err) => {
-                console.warn("Supabase save failed; squad kept in local storage", err);
-              });
-              return { ...prev, season: nextSeason };
-            });
+          queueMicrotask(async () => {
+            const prevSeason = seasonRef.current;
+            if (prevSeason.players.includes(nm)) return;
+            const nextSeason = { ...prevSeason, players: [...prevSeason.players, nm] };
+            try {
+              await upsertSeasonToSupabase(nextSeason);
+              setState((prev) => ({ ...prev, season: nextSeason }));
+              setLastSyncedAt(Date.now());
+              setLastSyncFailed(false);
+              showToast("Saved ✓");
+            } catch (e) {
+              showToast(e?.message || "Could not save squad");
+            }
           });
           break;
         }
         case "squad_remove": {
           const nm = pending.meta?.name;
           if (!row?.is_admin) {
-            toast("Only admins can change the squad");
+            showToast("Only admins can change the squad");
             break;
           }
           if (!nm) break;
-          queueMicrotask(() => {
-            setState((prev) => {
-              const nextSeason = { ...prev.season, players: prev.season.players.filter((p) => p !== nm) };
-              upsertSeasonToSupabase(nextSeason).catch((err) => {
-                console.warn("Supabase save failed; squad kept in local storage", err);
-              });
-              return { ...prev, season: nextSeason };
-            });
+          queueMicrotask(async () => {
+            const prevSeason = seasonRef.current;
+            const nextSeason = { ...prevSeason, players: prevSeason.players.filter((p) => p !== nm) };
+            try {
+              await upsertSeasonToSupabase(nextSeason);
+              setState((prev) => ({ ...prev, season: nextSeason }));
+              setLastSyncedAt(Date.now());
+              setLastSyncFailed(false);
+              showToast("Saved ✓");
+            } catch (e) {
+              showToast(e?.message || "Could not save squad");
+            }
           });
           break;
         }
@@ -3291,14 +3362,28 @@ export default function App() {
       <style>{CSS}</style>
       {toastMsg ? <div className="toast-mini">{toastMsg}</div> : null}
       <div className="app">
-        {view === "dashboard" && <Dashboard />}
-        {view === "new_match" && <NewMatch />}
-        {view === "live" && <LiveMatch />}
-        {view === "squad" && <Squad />}
-        {view === "history" && <History />}
-        {view === "profile" && <Profile />}
-        {view === "account" && <Account />}
-        {view === "player_profile" && playerProfileName && <PlayerProfileView />}
+        {seasonLoadStatus !== "ready" ? (
+          <div className="app-loading">
+            <div className="app-loading-spinner" aria-hidden />
+            <div>Loading season…</div>
+          </div>
+        ) : (
+          <>
+            {bootFromCache ? (
+              <div className="offline-banner" role="status">
+                Showing saved copy — could not reach server
+              </div>
+            ) : null}
+            {view === "dashboard" && <Dashboard />}
+            {view === "new_match" && <NewMatch />}
+            {view === "live" && <LiveMatch />}
+            {view === "squad" && <Squad />}
+            {view === "history" && <History />}
+            {view === "profile" && <Profile />}
+            {view === "account" && <Account />}
+            {view === "player_profile" && playerProfileName && <PlayerProfileView />}
+          </>
+        )}
       </div>
 
       {authModal.open && (
@@ -3446,7 +3531,7 @@ export default function App() {
         </div>
       )}
 
-      {!logStep && (
+      {seasonLoadStatus === "ready" && !logStep && (
         <nav className="nav">
           <button
             type="button"
